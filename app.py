@@ -1,8 +1,11 @@
 # streamlit_app.py
+# Run:
+#   pip install streamlit requests feedparser trafilatura pandas scikit-learn vaderSentiment langdetect python-dateutil matplotlib
+#   streamlit run streamlit_app.py
+
 from __future__ import annotations
 
 import json
-import os
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -17,10 +20,19 @@ import trafilatura
 from dateutil import parser as dateparser
 from langdetect import detect
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-
 from sklearn.decomposition import NMF
 from sklearn.feature_extraction.text import TfidfVectorizer
 
+# =========================
+# HTTP SETTINGS (IMPORTANT)
+# =========================
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; PackagingTrendsMonitor/1.0)",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Connection": "keep-alive",
+}
 
 # =========================
 # DEFAULT CONFIG
@@ -45,7 +57,6 @@ DEFAULT_OFFICIAL_URLS = [
 ]
 
 DB_PATH_DEFAULT = "packaging_trends.db"
-
 
 LAW_PATTERNS = [
     r"\bPPWR\b",
@@ -132,16 +143,27 @@ def load_documents(db_path: str, days: int) -> pd.DataFrame:
 
 
 # =========================
-# SCRAPING / EXTRACTION
+# FETCHING / EXTRACTION
 # =========================
 
-def extract_main_text(url: str, timeout: int = 20) -> str:
+def fetch_url_text(url: str, timeout: int = 25) -> str:
+    """Fetch page HTML with headers; returns empty string if blocked/error."""
+    r = requests.get(url, headers=HEADERS, timeout=timeout)
+    r.raise_for_status()
+    # Some sites return bytes that decode poorly; requests handles decoding best-effort via r.text.
+    return r.text
+
+
+def extract_main_text(url: str, timeout: int = 25) -> str:
+    """
+    Robust extractor:
+    - Uses requests + User-Agent to reduce blocks
+    - Extracts readable text via Trafilatura
+    """
     try:
-        downloaded = trafilatura.fetch_url(url, timeout=timeout)
-        if not downloaded:
-            return ""
-        text = trafilatura.extract(downloaded, include_comments=False, include_tables=False)
-        return text or ""
+        html = fetch_url_text(url, timeout=timeout)
+        text = trafilatura.extract(html, include_comments=False, include_tables=False)
+        return (text or "").strip()
     except Exception:
         return ""
 
@@ -175,21 +197,32 @@ def fetch_gdelt_articles(keywords: List[str], days: int, max_records: int) -> Li
         "enddatetime": end.strftime("%Y%m%d%H%M%S"),
     }
     url = "https://api.gdeltproject.org/api/v2/doc/doc"
-    r = requests.get(url, params=params, timeout=30)
+    r = requests.get(url, params=params, headers=HEADERS, timeout=30)
     r.raise_for_status()
     data = r.json()
     return data.get("articles", [])
 
 
-def collect_gdelt(db_path: str, keywords: List[str], days: int, max_records: int, status_cb=None) -> Tuple[int, int]:
+def collect_gdelt(
+    db_path: str,
+    keywords: List[str],
+    days: int,
+    max_records: int,
+    status_cb=None
+) -> Tuple[int, int, int]:
+    """
+    Returns: (inserted, fetched, extracted_ok)
+    extracted_ok counts how many article URLs produced enough text.
+    """
     articles = fetch_gdelt_articles(keywords=keywords, days=days, max_records=max_records)
     inserted = 0
+    extracted_ok = 0
 
     for i, a in enumerate(articles, start=1):
         if status_cb:
             status_cb(f"GDELT: processing {i}/{len(articles)}")
 
-        url = a.get("url", "") or ""
+        url = (a.get("url") or "").strip()
         if not url:
             continue
 
@@ -204,7 +237,9 @@ def collect_gdelt(db_path: str, keywords: List[str], days: int, max_records: int
         if not text or len(text) < 400:
             continue
 
+        extracted_ok += 1
         lang = detect_language(text)
+
         doc = Document(
             source="gdelt",
             url=url,
@@ -217,21 +252,34 @@ def collect_gdelt(db_path: str, keywords: List[str], days: int, max_records: int
         if upsert_document(doc, db_path=db_path):
             inserted += 1
 
-    return inserted, len(articles)
+    return inserted, len(articles), extracted_ok
 
 
-def collect_rss(db_path: str, feed_urls: List[str], days: int, status_cb=None) -> int:
+def collect_rss(db_path: str, feed_urls: List[str], days: int, status_cb=None) -> Tuple[int, int]:
+    """
+    Returns: (inserted, entries_seen)
+    """
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     inserted = 0
+    entries_seen = 0
 
     for feed_idx, feed_url in enumerate(feed_urls, start=1):
         if status_cb:
             status_cb(f"RSS: loading feed {feed_idx}/{len(feed_urls)}")
 
-        d = feedparser.parse(feed_url)
+        # Fetch the feed with headers (helps with blocks)
+        try:
+            r = requests.get(feed_url, headers=HEADERS, timeout=25)
+            r.raise_for_status()
+            d = feedparser.parse(r.content)
+        except Exception:
+            continue
+
         entries = getattr(d, "entries", []) or []
 
         for i, e in enumerate(entries, start=1):
+            entries_seen += 1
+
             link = getattr(e, "link", "") or ""
             title = getattr(e, "title", "") or ""
             published = getattr(e, "published", "") or getattr(e, "updated", "") or ""
@@ -247,7 +295,7 @@ def collect_rss(db_path: str, feed_urls: List[str], days: int, status_cb=None) -
                 continue
 
             if status_cb:
-                status_cb(f"RSS: processing entry {i}/{len(entries)} in feed {feed_idx}")
+                status_cb(f"RSS: entry {i}/{len(entries)} (feed {feed_idx})")
 
             text = extract_main_text(link)
             if not text or len(text) < 300:
@@ -272,22 +320,28 @@ def collect_rss(db_path: str, feed_urls: List[str], days: int, status_cb=None) -
             if upsert_document(doc, db_path=db_path):
                 inserted += 1
 
-    return inserted
+    return inserted, entries_seen
 
 
-def collect_official(db_path: str, urls: List[str], status_cb=None) -> int:
+def collect_official(db_path: str, urls: List[str], status_cb=None) -> Tuple[int, int]:
+    """
+    Returns: (inserted, extracted_ok)
+    """
     inserted = 0
+    extracted_ok = 0
     now = datetime.now(timezone.utc).isoformat()
 
     for i, url in enumerate(urls, start=1):
         if status_cb:
-            status_cb(f"Official: processing {i}/{len(urls)}")
+            status_cb(f"Official: {i}/{len(urls)}")
 
         text = extract_main_text(url)
         if not text or len(text) < 300:
             continue
 
+        extracted_ok += 1
         lang = detect_language(text)
+
         doc = Document(
             source="official",
             url=url,
@@ -300,7 +354,7 @@ def collect_official(db_path: str, urls: List[str], status_cb=None) -> int:
         if upsert_document(doc, db_path=db_path):
             inserted += 1
 
-    return inserted
+    return inserted, extracted_ok
 
 
 # =========================
@@ -399,8 +453,9 @@ with st.sidebar:
     st.header("Settings")
     db_path = st.text_input("SQLite DB path", DB_PATH_DEFAULT)
 
-    days_collect = st.slider("Collect: lookback days", 1, 180, 14)
-    max_records = st.slider("Collect: max news records (GDELT)", 10, 250, 120, step=10)
+    st.subheader("Collect")
+    days_collect = st.slider("Lookback days", 1, 180, 14)
+    max_records = st.slider("Max news records (GDELT)", 10, 250, 120, step=10)
 
     st.subheader("Keywords (one per line)")
     keywords_text = st.text_area(" ", "\n".join(DEFAULT_KEYWORDS), height=180)
@@ -415,8 +470,9 @@ with st.sidebar:
     official_urls = [u.strip() for u in official_text.splitlines() if u.strip()]
 
     st.divider()
-    days_analyze = st.slider("Analyze: time window days", 1, 365, 90)
-    only_english = st.checkbox("Analyze English only (recommended for VADER)", value=True)
+    st.subheader("Analyze")
+    days_analyze = st.slider("Time window days", 1, 365, 90)
+    only_english = st.checkbox("English only (recommended for VADER)", value=True)
 
 # init db
 init_db(db_path)
@@ -431,6 +487,8 @@ with tab1:
     run_rss = colB.checkbox("Collect from RSS feeds", value=True)
     run_official = colC.checkbox("Collect from official URLs", value=True)
 
+    st.caption("If inserts stay at 0, try adding more RSS feeds or use sources that allow scraping (no paywalls).")
+
     if st.button("🚀 Run collection", type="primary"):
         status = st.status("Starting...", expanded=True)
 
@@ -441,25 +499,27 @@ with tab1:
             inserted_total = 0
 
             if run_gdelt:
-                ins, fetched = collect_gdelt(db_path, keywords, days_collect, max_records, status_cb=cb)
-                status.write(f"✅ GDELT inserted {ins} (fetched {fetched})")
+                ins, fetched, extracted_ok = collect_gdelt(db_path, keywords, days_collect, max_records, status_cb=cb)
+                status.write(f"✅ GDELT fetched {fetched} | extracted text from {extracted_ok} | inserted {ins}")
                 inserted_total += ins
 
             if run_rss:
-                ins = collect_rss(db_path, rss_feeds, days_collect, status_cb=cb)
-                status.write(f"✅ RSS inserted {ins}")
+                ins, entries_seen = collect_rss(db_path, rss_feeds, days_collect, status_cb=cb)
+                status.write(f"✅ RSS entries seen {entries_seen} | inserted {ins}")
                 inserted_total += ins
 
             if run_official:
-                ins = collect_official(db_path, official_urls, status_cb=cb)
-                status.write(f"✅ Official inserted {ins}")
+                ins, extracted_ok = collect_official(db_path, official_urls, status_cb=cb)
+                status.write(f"✅ Official extracted {extracted_ok} | inserted {ins}")
                 inserted_total += ins
 
             status.update(label=f"Done. Total inserted: {inserted_total}", state="complete")
-        except Exception as e:
-            status.update(label=f"Error: {e}", state="error")
 
-    st.info("Tip: If some pages don’t extract text, that’s normal (paywalls, scripts, blocked pages). Try adding more RSS sources.")
+        except Exception as e:
+            status.update(label="Collection failed — see error below.", state="error")
+            st.exception(e)
+
+    st.info("Tip: Some pages won’t extract text (paywalls, scripts, blocked pages). Add more RSS feeds or use open sources.")
 
 with tab2:
     st.subheader("Analyze collected data")
@@ -468,68 +528,81 @@ with tab2:
     st.write(f"Loaded **{len(df)}** documents from the last **{days_analyze}** days.")
 
     if st.button("📊 Run analysis"):
-        results = analyze_df(df, only_english=only_english)
+        try:
+            results = analyze_df(df, only_english=only_english)
+            rdf = results.get("df", pd.DataFrame())
 
-        rdf = results.get("df", pd.DataFrame())
-        if rdf.empty:
-            st.warning("No documents to analyze.")
-        else:
-            st.success("Analysis complete.")
-
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Avg sentiment", f"{rdf['sentiment'].mean():.2f}")
-            c2.metric("Avg concern score", f"{rdf['concern_score'].mean():.2f}")
-            c3.metric("Avg expectation score", f"{rdf['expectation_score'].mean():.2f}")
-            c4.metric("Avg opportunity score", f"{rdf['opportunity_score'].mean():.2f}")
-
-            st.divider()
-            st.subheader("Top law/regulation mention patterns")
-            law_counts = results.get("law_counts", pd.DataFrame())
-            if not law_counts.empty:
-                st.dataframe(law_counts.head(15), use_container_width=True)
-                st.bar_chart(law_counts.head(15).set_index("law_hits")["mentions"])
+            if rdf.empty:
+                st.warning("No documents to analyze.")
             else:
-                st.write("No law mention patterns found in the current window.")
+                st.success("Analysis complete.")
 
-            st.divider()
-            st.subheader("Topics (TF-IDF + NMF)")
-            topics = results.get("topics", pd.DataFrame())
-            if not topics.empty:
-                st.dataframe(topics, use_container_width=True)
-            else:
-                st.write("Not enough documents to generate topics (need at least a few).")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Avg sentiment", f"{rdf['sentiment'].mean():.2f}")
+                c2.metric("Avg concern score", f"{rdf['concern_score'].mean():.2f}")
+                c3.metric("Avg expectation score", f"{rdf['expectation_score'].mean():.2f}")
+                c4.metric("Avg opportunity score", f"{rdf['opportunity_score'].mean():.2f}")
 
-            st.divider()
-            st.subheader("High-concern watchlist (top 20)")
-            watch = results.get("watch", pd.DataFrame())
-            if watch.empty:
-                st.write("No high-concern items found.")
-            else:
-                # show clickable links
-                show = watch[["published_at", "source", "title", "url", "concern_score", "sentiment"]].copy()
-                st.dataframe(show, use_container_width=True)
+                st.divider()
+                st.subheader("Top law/regulation mention patterns")
+                law_counts = results.get("law_counts", pd.DataFrame())
+                if not law_counts.empty:
+                    st.dataframe(law_counts.head(15), use_container_width=True)
+                    st.bar_chart(law_counts.head(15).set_index("law_hits")["mentions"])
+                else:
+                    st.write("No law mention patterns found in the current window.")
 
-            # downloads
-            out_dir = "outputs"
-            os.makedirs(out_dir, exist_ok=True)
-            rdf.to_csv(f"{out_dir}/documents_scored.csv", index=False)
-            law_counts.to_csv(f"{out_dir}/law_mentions.csv", index=False)
-            topics.to_csv(f"{out_dir}/topics.csv", index=False)
+                st.divider()
+                st.subheader("Topics (TF-IDF + NMF)")
+                topics = results.get("topics", pd.DataFrame())
+                if not topics.empty:
+                    st.dataframe(topics, use_container_width=True)
+                else:
+                    st.write("Not enough documents to generate topics (need at least a few).")
 
-            st.download_button(
-                "⬇️ Download scored documents CSV",
-                data=rdf.to_csv(index=False).encode("utf-8"),
-                file_name="documents_scored.csv",
-                mime="text/csv",
-            )
+                st.divider()
+                st.subheader("High-concern watchlist (top 20)")
+                watch = results.get("watch", pd.DataFrame())
+                if watch.empty:
+                    st.write("No high-concern items found.")
+                else:
+                    show = watch[["published_at", "source", "title", "url", "concern_score", "sentiment"]].copy()
+                    st.dataframe(show, use_container_width=True)
+
+                # downloads
+                st.download_button(
+                    "⬇️ Download scored documents CSV",
+                    data=rdf.to_csv(index=False).encode("utf-8"),
+                    file_name="documents_scored.csv",
+                    mime="text/csv",
+                )
+
+                st.download_button(
+                    "⬇️ Download law mentions CSV",
+                    data=law_counts.to_csv(index=False).encode("utf-8"),
+                    file_name="law_mentions.csv",
+                    mime="text/csv",
+                )
+
+                st.download_button(
+                    "⬇️ Download topics CSV",
+                    data=topics.to_csv(index=False).encode("utf-8"),
+                    file_name="topics.csv",
+                    mime="text/csv",
+                )
+
+        except Exception as e:
+            st.error("Analysis failed — see error below.")
+            st.exception(e)
 
 with tab3:
     st.subheader("Quick dashboard")
-    df = load_documents(db_path, days_analyze)
 
+    df = load_documents(db_path, days_analyze)
     if df.empty:
         st.write("No data yet. Go to **Collect** first.")
     else:
+        df = df.copy()
         df["published_at"] = pd.to_datetime(df["published_at"], errors="coerce")
         df = df.dropna(subset=["published_at"])
 
