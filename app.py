@@ -1,13 +1,14 @@
-# streamlit_app.py
+# app.py
 # Run:
 #   pip install streamlit requests feedparser trafilatura pandas scikit-learn vaderSentiment langdetect python-dateutil matplotlib
-#   streamlit run streamlit_app.py
+#   streamlit run app.py
 
 from __future__ import annotations
 
 import json
 import re
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple
@@ -23,8 +24,9 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from sklearn.decomposition import NMF
 from sklearn.feature_extraction.text import TfidfVectorizer
 
+
 # =========================
-# HTTP SETTINGS (IMPORTANT)
+# HTTP SETTINGS
 # =========================
 
 HEADERS = {
@@ -33,6 +35,7 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Connection": "keep-alive",
 }
+
 
 # =========================
 # DEFAULT CONFIG
@@ -147,19 +150,12 @@ def load_documents(db_path: str, days: int) -> pd.DataFrame:
 # =========================
 
 def fetch_url_text(url: str, timeout: int = 25) -> str:
-    """Fetch page HTML with headers; returns empty string if blocked/error."""
     r = requests.get(url, headers=HEADERS, timeout=timeout)
     r.raise_for_status()
-    # Some sites return bytes that decode poorly; requests handles decoding best-effort via r.text.
     return r.text
 
 
 def extract_main_text(url: str, timeout: int = 25) -> str:
-    """
-    Robust extractor:
-    - Uses requests + User-Agent to reduce blocks
-    - Extracts readable text via Trafilatura
-    """
     try:
         html = fetch_url_text(url, timeout=timeout)
         text = trafilatura.extract(html, include_comments=False, include_tables=False)
@@ -183,6 +179,12 @@ def detect_language(text: str) -> str:
 # =========================
 
 def fetch_gdelt_articles(keywords: List[str], days: int, max_records: int) -> List[Dict[str, Any]]:
+    """
+    Safer GDELT fetch:
+    - retries
+    - handles non-JSON responses
+    - returns [] instead of crashing
+    """
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=days)
 
@@ -196,11 +198,41 @@ def fetch_gdelt_articles(keywords: List[str], days: int, max_records: int) -> Li
         "startdatetime": start.strftime("%Y%m%d%H%M%S"),
         "enddatetime": end.strftime("%Y%m%d%H%M%S"),
     }
+
     url = "https://api.gdeltproject.org/api/v2/doc/doc"
-    r = requests.get(url, params=params, headers=HEADERS, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    return data.get("articles", [])
+
+    last_preview = ""
+    last_status = None
+
+    for attempt in range(1, 4):  # up to 3 tries
+        r = requests.get(url, params=params, headers=HEADERS, timeout=30)
+        last_status = r.status_code
+        content_type = (r.headers.get("Content-Type") or "").lower()
+        last_preview = (r.text or "")[:300]
+
+        # Retry on common blocking/limiting/server cases
+        if r.status_code in (429, 403) or r.status_code >= 500:
+            time.sleep(1.5 * attempt)
+            continue
+
+        # If it doesn't look like JSON, retry
+        if ("json" not in content_type) and not (r.text or "").lstrip().startswith("{"):
+            time.sleep(1.0 * attempt)
+            continue
+
+        try:
+            data = r.json()
+            return data.get("articles", []) or []
+        except Exception:
+            time.sleep(1.0 * attempt)
+            continue
+
+    # If still failing, show warning and return empty
+    st.warning(
+        "GDELT returned a non-JSON response (possibly rate-limited/blocked). "
+        f"Last HTTP status: {last_status}. Response preview: {last_preview!r}"
+    )
+    return []
 
 
 def collect_gdelt(
@@ -212,7 +244,6 @@ def collect_gdelt(
 ) -> Tuple[int, int, int]:
     """
     Returns: (inserted, fetched, extracted_ok)
-    extracted_ok counts how many article URLs produced enough text.
     """
     articles = fetch_gdelt_articles(keywords=keywords, days=days, max_records=max_records)
     inserted = 0
@@ -267,7 +298,6 @@ def collect_rss(db_path: str, feed_urls: List[str], days: int, status_cb=None) -
         if status_cb:
             status_cb(f"RSS: loading feed {feed_idx}/{len(feed_urls)}")
 
-        # Fetch the feed with headers (helps with blocks)
         try:
             r = requests.get(feed_url, headers=HEADERS, timeout=25)
             r.raise_for_status()
@@ -346,7 +376,7 @@ def collect_official(db_path: str, urls: List[str], status_cb=None) -> Tuple[int
             source="official",
             url=url,
             title=url,
-            published_at=now,  # snapshot time
+            published_at=now,
             text=text,
             language=lang,
             metadata_json=json.dumps({}, ensure_ascii=False),
@@ -432,12 +462,7 @@ def analyze_df(df: pd.DataFrame, only_english: bool) -> Dict[str, Any]:
     watch = df[df["concern_score"] >= 2].copy()
     watch = watch.sort_values(["concern_score", "published_at"], ascending=[False, False]).head(20)
 
-    return {
-        "df": df,
-        "law_counts": law_counts,
-        "topics": topics_df,
-        "watch": watch,
-    }
+    return {"df": df, "law_counts": law_counts, "topics": topics_df, "watch": watch}
 
 
 # =========================
@@ -474,7 +499,6 @@ with st.sidebar:
     days_analyze = st.slider("Time window days", 1, 365, 90)
     only_english = st.checkbox("English only (recommended for VADER)", value=True)
 
-# init db
 init_db(db_path)
 
 tab1, tab2, tab3 = st.tabs(["1) Collect", "2) Analyze", "3) Dashboard"])
@@ -487,7 +511,7 @@ with tab1:
     run_rss = colB.checkbox("Collect from RSS feeds", value=True)
     run_official = colC.checkbox("Collect from official URLs", value=True)
 
-    st.caption("If inserts stay at 0, try adding more RSS feeds or use sources that allow scraping (no paywalls).")
+    st.caption("If inserts stay at 0, add more RSS feeds or use sources that allow scraping (no paywalls).")
 
     if st.button("🚀 Run collection", type="primary"):
         status = st.status("Starting...", expanded=True)
@@ -569,21 +593,18 @@ with tab2:
                     show = watch[["published_at", "source", "title", "url", "concern_score", "sentiment"]].copy()
                     st.dataframe(show, use_container_width=True)
 
-                # downloads
                 st.download_button(
                     "⬇️ Download scored documents CSV",
                     data=rdf.to_csv(index=False).encode("utf-8"),
                     file_name="documents_scored.csv",
                     mime="text/csv",
                 )
-
                 st.download_button(
                     "⬇️ Download law mentions CSV",
                     data=law_counts.to_csv(index=False).encode("utf-8"),
                     file_name="law_mentions.csv",
                     mime="text/csv",
                 )
-
                 st.download_button(
                     "⬇️ Download topics CSV",
                     data=topics.to_csv(index=False).encode("utf-8"),
