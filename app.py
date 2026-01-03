@@ -587,8 +587,8 @@ with tab_collect:
                 )
                 total_inserted += ins
                 st.success(f"✅ GDELT seen {seen} | extracted {extracted_ok} | inserted {ins}")
-                with st.expander("GDELT debug (open if seen=0)"):
-                    st.json(debug)
+                # with st.expander("GDELT debug (open if seen=0)"):
+                #     st.json(debug)
 
         if do_rss:
             with st.spinner("Collecting from RSS…"):
