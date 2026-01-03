@@ -1,11 +1,6 @@
 streamlit
 requests
 feedparser
-trafilatura
 pandas
-scikit-learn
-vaderSentiment
-langdetect
+beautifulsoup4
 python-dateutil
-tqdm
-matplotlib
