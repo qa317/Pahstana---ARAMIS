@@ -522,7 +522,6 @@ st.title("📦 Packaging Trends Monitor (Fixed + More News Sources)")
 st.caption("Collect packaging trend info (GDELT + RSS + GNews + official), explore it, and analyze key signals.")
 
 with st.sidebar:
-    st.header("Settings")
 
     db_path = DEFAULT_DB
     con = db_connect(db_path)
