@@ -524,7 +524,7 @@ st.caption("Collect packaging trend info (GDELT + RSS + GNews + official), explo
 with st.sidebar:
     st.header("Settings")
 
-    db_path = st.text_input("SQLite DB path", DEFAULT_DB, help="Created automatically if it doesn't exist.")
+    db_path = DEFAULT_DB
     con = db_connect(db_path)
     init_db(con)
 
