@@ -1,9 +1,15 @@
 # app.py
+# Simple Streamlit app with 3 tabs: Collect / Explore / Analyze
+# Fixes "GDELT always 0" by auto-retrying with 90 days and then without date filters.
+#
+# Run:
+#   pip install streamlit requests feedparser pandas beautifulsoup4 python-dateutil
+#   streamlit run app.py
+
 from __future__ import annotations
 
 import re
 import sqlite3
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -15,8 +21,9 @@ import feedparser
 from bs4 import BeautifulSoup
 from dateutil import parser as dtparser
 
+
 # ----------------------------
-# Defaults (these DO return items)
+# Defaults
 # ----------------------------
 
 DEFAULT_DB = "packaging_trends.db"
@@ -33,7 +40,7 @@ DEFAULT_KEYWORDS = [
     "packaging labeling",
 ]
 
-# Reliable RSS sources (Google News RSS search feeds)
+# Reliable RSS: Google News RSS search feeds (usually returns entries)
 DEFAULT_RSS_FEEDS = [
     "https://news.google.com/rss/search?q=PPWR%20packaging%20EU&hl=en&gl=EU&ceid=EU:en",
     "https://news.google.com/rss/search?q=packaging%20waste%20regulation%20EU&hl=en&gl=EU&ceid=EU:en",
@@ -120,7 +127,6 @@ def insert_doc(
             ),
         )
         con.commit()
-        # Check if inserted / exists
         cur = con.execute("SELECT 1 FROM documents WHERE url=? LIMIT 1;", (url,))
         return cur.fetchone() is not None
     except Exception:
@@ -147,7 +153,7 @@ def load_docs(con: sqlite3.Connection, days: int = 90, limit: int = 5000) -> pd.
 
 
 # ----------------------------
-# Extraction (fast + decent)
+# Extraction (fast)
 # ----------------------------
 
 def fetch(url: str, timeout: int = 20) -> requests.Response:
@@ -188,11 +194,11 @@ def parse_date_any(s: str) -> Optional[datetime]:
 
 
 # ----------------------------
-# GDELT
+# GDELT (with auto-retries to avoid 0)
 # ----------------------------
 
 def build_gdelt_query(keywords: List[str]) -> str:
-    # Phrases get quoted; single words not quoted. Joined with OR.
+    # Phrases quoted, single words not; join OR.
     terms = []
     for k in keywords:
         k = k.strip()
@@ -202,32 +208,22 @@ def build_gdelt_query(keywords: List[str]) -> str:
             terms.append(f'"{k}"')
         else:
             terms.append(k)
-    # If user provides many, keep it reasonable:
     if len(terms) > 15:
         terms = terms[:15]
     return " OR ".join(terms) if terms else "packaging waste EU"
 
 
 def gdelt_request(query: str, days: int, max_records: int) -> Tuple[List[Dict], Dict]:
-    # GDELT doc API behaves best within ~90 days
-    days = max(1, min(int(days), 90))
+    """
+    Tries:
+      1) user date window
+      2) retry with 90 days (if needed)
+      3) retry without date filters (if still 0)
+    Returns (articles, debug).
+    """
 
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=days)
-
-    params = {
-        "query": query,
-        "mode": "ArtList",
-        "format": "json",
-        "sort": "HybridRel",
-        "maxrecords": int(max_records),
-        "startdatetime": start.strftime("%Y%m%d%H%M%S"),
-        "enddatetime": end.strftime("%Y%m%d%H%M%S"),
-    }
-
-    debug: Dict = {"endpoint": GDELT_ENDPOINT, "params": params}
-
-    try:
+    def do_call(params: Dict) -> Tuple[List[Dict], Dict]:
+        debug: Dict = {"endpoint": GDELT_ENDPOINT, "params": params}
         r = requests.get(GDELT_ENDPOINT, params=params, headers=HEADERS, timeout=25)
         debug["status_code"] = r.status_code
         debug["final_url"] = r.url
@@ -237,17 +233,50 @@ def gdelt_request(query: str, days: int, max_records: int) -> Tuple[List[Dict], 
         if r.status_code != 200:
             return [], debug
 
-        # If not JSON, return []
         ct = (r.headers.get("Content-Type") or "").lower()
         if "json" not in ct and not (r.text or "").lstrip().startswith("{"):
             return [], debug
 
         data = r.json()
-        articles = data.get("articles", []) or []
-        return articles, debug
-    except Exception as e:
-        debug["error"] = repr(e)
-        return [], debug
+        return (data.get("articles", []) or []), debug
+
+    # 1) try user window (cap within 1..90)
+    days = max(1, min(int(days), 90))
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+    params = {
+        "query": query,
+        "mode": "ArtList",
+        "format": "json",
+        "sort": "HybridRel",
+        "maxrecords": int(max_records),
+        "startdatetime": start.strftime("%Y%m%d%H%M%S"),
+        "enddatetime": end.strftime("%Y%m%d%H%M%S"),
+    }
+    articles, debug = do_call(params)
+
+    # 2) retry with 90 days if 0
+    if len(articles) == 0 and days < 90:
+        start90 = end - timedelta(days=90)
+        params90 = dict(params)
+        params90["startdatetime"] = start90.strftime("%Y%m%d%H%M%S")
+        params90["enddatetime"] = end.strftime("%Y%m%d%H%M%S")
+        articles90, debug90 = do_call(params90)
+        debug["retry_90_days"] = debug90
+        if len(articles90) > 0:
+            return articles90, debug
+
+    # 3) retry without dates
+    params_nodate = {
+        "query": query,
+        "mode": "ArtList",
+        "format": "json",
+        "sort": "HybridRel",
+        "maxrecords": int(max_records),
+    }
+    articles_nd, debug_nd = do_call(params_nodate)
+    debug["retry_no_dates"] = debug_nd
+    return articles_nd, debug
 
 
 def collect_gdelt(
@@ -264,7 +293,7 @@ def collect_gdelt(
     query = build_gdelt_query(keywords)
     articles, debug = gdelt_request(query=query, days=days, max_records=max_records)
 
-    # Fallback if 0 articles: run a simpler query
+    # Fallback query if still 0
     if len(articles) == 0:
         fallback_query = "packaging waste EU OR PPWR OR sustainable packaging Europe"
         articles2, debug2 = gdelt_request(query=fallback_query, days=days, max_records=max_records)
@@ -275,9 +304,7 @@ def collect_gdelt(
     seen = len(articles)
     inserted = 0
     extracted_ok = 0
-
-    # If you want speed, don’t fetch full text for all results
-    full_text_budget = max(0, int(max_full_text))
+    budget = max(0, int(max_full_text))
 
     for idx, a in enumerate(articles, start=1):
         url = (a.get("url") or "").strip()
@@ -285,7 +312,6 @@ def collect_gdelt(
         seendate = (a.get("seendate") or "").strip()
 
         published_at = None
-        # seendate sometimes is "YYYYMMDDHHMMSS"
         if re.fullmatch(r"\d{14}", seendate):
             try:
                 published_at = datetime.strptime(seendate, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
@@ -293,7 +319,8 @@ def collect_gdelt(
                 published_at = None
 
         text = ""
-        if fetch_full_text and idx <= full_text_budget and url:
+        # Speed: only fetch full text for first N
+        if fetch_full_text and idx <= budget and url:
             try:
                 page = fetch(url, timeout=20)
                 if page.status_code == 200:
@@ -301,7 +328,7 @@ def collect_gdelt(
             except Exception:
                 text = ""
 
-        # If no full text, store at least the title so you still “have data”
+        # Always store something usable
         if not text:
             text = title
 
@@ -324,9 +351,6 @@ def collect_rss(
     fetch_full_text: bool,
     max_per_feed: int,
 ) -> Tuple[int, int, int]:
-    """
-    Returns: inserted, entries_seen, extracted_ok
-    """
     inserted = 0
     entries_seen = 0
     extracted_ok = 0
@@ -346,13 +370,11 @@ def collect_rss(
             elif getattr(e, "updated", None):
                 published_at = parse_date_any(getattr(e, "updated", ""))
 
-            # Start with summary/description (fast + reliable)
-            summary = (getattr(e, "summary", "") or getattr(e, "description", "") or "").strip()
-            summary_text = re.sub(r"\s+", " ", BeautifulSoup(summary, "html.parser").get_text(" ", strip=True))
+            summary_html = (getattr(e, "summary", "") or getattr(e, "description", "") or "").strip()
+            summary_text = re.sub(r"\s+", " ", BeautifulSoup(summary_html, "html.parser").get_text(" ", strip=True))
 
-            text = summary_text
+            text = summary_text or title
 
-            # Optionally fetch article page text (slower, may be blocked)
             if fetch_full_text and url:
                 try:
                     page = fetch(url, timeout=20)
@@ -373,7 +395,7 @@ def collect_rss(
 
 
 # ----------------------------
-# Official URLs
+# Official
 # ----------------------------
 
 def collect_official(
@@ -399,7 +421,7 @@ def collect_official(
 
 
 # ----------------------------
-# Dashboard analysis (simple + useful)
+# Analyze
 # ----------------------------
 
 STOPWORDS = set("""
@@ -448,37 +470,36 @@ def simple_signals(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ----------------------------
-# Streamlit UI (3 tabs)
+# UI (3 tabs)
 # ----------------------------
 
 st.set_page_config(page_title="Packaging Trends Monitor", layout="wide")
-st.title("📦 Packaging Trends Monitor (Simple)")
-st.caption("Collect public packaging trend info (GDELT + RSS + official pages), store in SQLite, explore it, and analyze signals.")
+st.title("📦 Packaging Trends Monitor (Simple + Fixed GDELT)")
+st.caption("Collect packaging trend info (news + RSS + official), explore it, and analyze key signals.")
 
 with st.sidebar:
     st.header("Settings")
-
     db_path = st.text_input("SQLite DB path", DEFAULT_DB, help="Created automatically if it doesn't exist.")
     con = db_connect(db_path)
     init_db(con)
 
     st.subheader("Collect settings")
-    days_collect = st.slider("Lookback days (GDELT)", 1, 90, 14)
+    days_collect = st.slider("Lookback days (GDELT)", 1, 90, 30)
     max_records = st.slider("Max GDELT records", 10, 300, 120, step=10)
 
-    keywords_text = st.text_area("Keywords (one per line)", "\n".join(DEFAULT_KEYWORDS), height=160)
+    keywords_text = st.text_area("Keywords (one per line)", "\n".join(DEFAULT_KEYWORDS), height=150)
     keywords = [k.strip() for k in keywords_text.splitlines() if k.strip()]
 
-    rss_text = st.text_area("RSS feeds (one per line)", "\n".join(DEFAULT_RSS_FEEDS), height=160)
+    rss_text = st.text_area("RSS feeds (one per line)", "\n".join(DEFAULT_RSS_FEEDS), height=150)
     rss_feeds = [u.strip() for u in rss_text.splitlines() if u.strip()]
 
-    official_text = st.text_area("Official URLs (one per line)", "\n".join(DEFAULT_OFFICIAL_URLS), height=120)
+    official_text = st.text_area("Official URLs (one per line)", "\n".join(DEFAULT_OFFICIAL_URLS), height=110)
     official_urls = [u.strip() for u in official_text.splitlines() if u.strip()]
 
     st.divider()
     st.subheader("Speed options")
     gdelt_full_text = st.checkbox("GDELT: fetch full article text (slower)", value=False)
-    gdelt_full_text_n = st.slider("GDELT full-text limit", 0, 60, 20, help="Only first N GDELT articles will be downloaded for text.")
+    gdelt_full_text_n = st.slider("GDELT full-text limit", 0, 60, 20)
     rss_full_text = st.checkbox("RSS: fetch full article text (slower)", value=False)
     rss_max_per_feed = st.slider("RSS max items per feed", 5, 60, 25)
 
@@ -489,14 +510,12 @@ tab_collect, tab_explore, tab_analyze = st.tabs(["Collect data", "Explore data",
 with tab_collect:
     st.subheader("Collect data")
 
-    col1, col2, col3 = st.columns(3)
-    use_gdelt = col1.checkbox("Collect from GDELT (news)", value=True)
-    use_rss = col2.checkbox("Collect from RSS feeds", value=True)
-    use_official = col3.checkbox("Collect from official pages", value=True)
+    c1, c2, c3 = st.columns(3)
+    use_gdelt = c1.checkbox("Collect from GDELT (news)", value=True)
+    use_rss = c2.checkbox("Collect from RSS feeds", value=True)
+    use_official = c3.checkbox("Collect from official pages", value=True)
 
     if st.button("🚀 Run collection", type="primary"):
-        debug_holder = None
-
         total_inserted = 0
 
         if use_gdelt:
@@ -508,7 +527,7 @@ with tab_collect:
                 )
                 total_inserted += ins
                 st.success(f"✅ GDELT seen {seen} | extracted {extracted_ok} | inserted {ins}")
-                with st.expander("GDELT debug (click if you still see 0)"):
+                with st.expander("GDELT debug (open if seen=0)"):
                     st.json(debug)
 
         if use_rss:
@@ -529,16 +548,16 @@ with tab_collect:
 
         if total_inserted == 0:
             st.warning(
-                "No new documents inserted. Open **GDELT debug** above to see status/preview, "
-                "and try keeping only 2–3 keywords (e.g., 'PPWR', 'packaging waste', 'sustainable packaging')."
+                "No new documents inserted. Try increasing lookback days (30–90) and use broader keywords "
+                "(e.g., 'packaging waste', 'sustainable packaging', 'PPWR')."
             )
 
-    st.info("Tip: For fastest results, keep RSS full-text OFF. You’ll still get summaries, which is enough for analysis.")
+    st.info("Fast mode tip: keep full-text OFF. You still collect titles/summaries and can analyze topics/signals.")
 
 
 with tab_explore:
     st.subheader("Explore data")
-    days_view = st.slider("Show data from last N days", 7, 365, 90)
+    days_view = st.slider("Show data from last N days", 7, 365, 120)
 
     df = load_docs(con, days=days_view)
     if df.empty:
@@ -577,17 +596,17 @@ with tab_explore:
 
 with tab_analyze:
     st.subheader("Analyze (Dashboard)")
-    days_dash = st.slider("Analyze last N days", 7, 365, 90)
+    days_dash = st.slider("Analyze last N days", 7, 365, 120)
 
     df = load_docs(con, days=days_dash)
     if df.empty:
         st.info("No data yet. Collect first.")
     else:
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Documents", f"{len(df):,}")
-        c2.metric("Sources", f"{df['source'].nunique()}")
-        c3.metric("Domains", f"{df['domain'].nunique()}")
-        c4.metric("With text", f"{int((df['text'].fillna('').str.len() > 0).sum())}")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Documents", f"{len(df):,}")
+        m2.metric("Sources", f"{df['source'].nunique()}")
+        m3.metric("Domains", f"{df['domain'].nunique()}")
+        m4.metric("With text", f"{int((df['text'].fillna('').str.len() > 0).sum())}")
 
         st.write("### Documents over time")
         tmp = df.copy()
@@ -603,7 +622,7 @@ with tab_analyze:
         terms = top_terms(df, n=25)
         st.dataframe(terms, use_container_width=True)
 
-        st.write("### Signals (concerns / expectations buckets)")
+        st.write("### Signals (concern / expectation buckets)")
         sig = simple_signals(df)
         if sig.empty:
             st.info("No signals detected yet (try collecting more items).")
@@ -611,7 +630,7 @@ with tab_analyze:
             st.dataframe(sig, use_container_width=True)
             st.bar_chart(sig.set_index("signal")["count"])
 
-        st.write("### Recent items (quick view)")
+        st.write("### Recent items")
         recent = df.head(20).copy()
         recent["published_at"] = recent["published_at"].dt.strftime("%Y-%m-%d %H:%M").fillna("")
         st.dataframe(recent[["source", "published_at", "title", "url"]], use_container_width=True, hide_index=True)
