@@ -1,10 +1,12 @@
-# app.py
+# app.py (REVISED)
 # 3 tabs: Collect data / Explore data / Analyze (Dashboard)
-# News sources:
-#   - GDELT (with auto-retries: user window -> 90 days -> no dates + fallback query)
-#   - RSS feeds (default: Google News RSS searches)
-#   - GNews library (optional extra news source)
-#   - Official pages (EU Commission / EUR-Lex)
+# Improvements included:
+#   ✅ Source diversification (adds non-Google RSS feeds + keeps Google News RSS)
+#   ✅ Expanded "Official Watchlist" (more EU/institutional pages by default)
+#   ✅ URL normalization (removes tracking params → better deduplication)
+#   ✅ Secondary dedupe (title+domain hash) to reduce near-duplicates
+#   ✅ Source credibility categories (Institutional / Mainstream / Trade / NGO / Other)
+#   ✅ Emerging signals (terms increasing in last X days vs previous period)
 #
 # Run:
 #   pip install streamlit requests feedparser pandas beautifulsoup4 python-dateutil gnews
@@ -12,12 +14,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import sqlite3
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone, date
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit, parse_qsl, urlencode
 
 import pandas as pd
 import requests
@@ -26,7 +28,7 @@ import feedparser
 from bs4 import BeautifulSoup
 from dateutil import parser as dtparser
 
-# Optional: GNews library (like your example)
+# Optional: GNews library
 try:
     from gnews import GNews  # type: ignore
 except Exception:
@@ -42,6 +44,7 @@ GDELT_ENDPOINT = "https://api.gdeltproject.org/api/v2/doc/doc"
 DEFAULT_KEYWORDS = [
     "packaging waste",
     "PPWR",
+    "packaging and packaging waste regulation",
     "sustainable packaging",
     "recyclable packaging",
     "recycled content packaging",
@@ -50,27 +53,133 @@ DEFAULT_KEYWORDS = [
     "deposit return scheme",
     "PFAS packaging",
     "packaging labeling",
+    "greenwashing packaging",
 ]
 
-# Reliable RSS (Google News RSS queries) — usually returns entries quickly
+# Google News RSS queries (reliable) + a few direct feeds (diversify).
+# NOTE: Some publishers change RSS endpoints over time. If a feed stops working,
+# remove it or replace it (the app will safely skip failing feeds).
 DEFAULT_RSS_FEEDS = [
-    "https://news.google.com/rss/search?q=packaging%20waste%20EU&hl=en&gl=EU&ceid=EU:en",
-    "https://news.google.com/rss/search?q=PPWR%20packaging%20waste%20regulation&hl=en&gl=EU&ceid=EU:en",
-    "https://news.google.com/rss/search?q=sustainable%20packaging%20Europe&hl=en&gl=EU&ceid=EU:en",
-    "https://news.google.com/rss/search?q=reusable%20packaging%20Europe&hl=en&gl=EU&ceid=EU:en",
-    "https://news.google.com/rss/search?q=EPR%20packaging%20Europe&hl=en&gl=EU&ceid=EU:en",
+    # --- Google News RSS (broad coverage) ---
+    "https://news.google.com/rss/search?q=packaging%20waste%20EU&hl=en&gl=FR&ceid=FR:en",
+    "https://news.google.com/rss/search?q=PPWR%20packaging%20waste%20regulation&hl=en&gl=FR&ceid=FR:en",
+    "https://news.google.com/rss/search?q=sustainable%20packaging%20Europe&hl=en&gl=FR&ceid=FR:en",
+    "https://news.google.com/rss/search?q=reusable%20packaging%20Europe&hl=en&gl=FR&ceid=FR:en",
+    "https://news.google.com/rss/search?q=EPR%20packaging%20Europe&hl=en&gl=FR&ceid=FR:en",
+    "https://news.google.com/rss/search?q=PFAS%20packaging%20Europe&hl=en&gl=FR&ceid=FR:en",
+    # --- Direct / sector feeds (diversification) ---
+    # Packaging industry media (often has RSS, but endpoints can change)
+    "https://packagingeurope.com/feed/",
+    # NGOs / civil society (signal source)
+    "https://zerowasteeurope.eu/feed/",
+    # Think tank / circular economy ecosystem
+    "https://www.ellenmacarthurfoundation.org/feeds/latest",
+    # European Commission press corner (often stable, but can change)
+    "https://ec.europa.eu/commission/presscorner/api/rss?language=en",
 ]
 
+# Expanded "Official Watchlist" (more institutional coverage)
 DEFAULT_OFFICIAL_URLS = [
+    # European Commission topic page (packaging waste)
     "https://environment.ec.europa.eu/topics/waste-and-recycling/packaging-waste_en",
+    # Eur-Lex regulation page (you already had this)
     "https://eur-lex.europa.eu/eli/reg/2025/40/oj/eng",
+    # EUR-Lex page for waste policy area (broad legal scanning entry point)
+    "https://eur-lex.europa.eu/browse/directories/legislation.html?lang=en",
+    # European Parliament: environment / waste (broad institutional signals)
+    "https://www.europarl.europa.eu/topics/en/article/20190110STO23109/waste-and-recycling",
+    # ECHA: PFAS topic landing page (chemicals in packaging discussions)
+    "https://echa.europa.eu/hot-topics/perfluoroalkyl-chemicals-pfas",
+    # European Environment Agency: waste topic
+    "https://www.eea.europa.eu/themes/waste",
 ]
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; PackagingTrendsMonitor/1.0)",
-    "Accept-Language": "en-US,en;q=0.9",
+    "User-Agent": "Mozilla/5.0 (compatible; GreenPackAnalytics/1.0; +https://example.com)",
+    "Accept-Language": "en-US,en;q=0.9,fr;q=0.7",
     "Accept": "*/*",
 }
+
+# ----------------------------
+# URL normalization / Dedupe
+# ----------------------------
+
+TRACKING_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "gclid", "fbclid", "mc_cid", "mc_eid", "ref", "src", "spm", "ito"
+}
+
+def normalize_url(url: str) -> str:
+    """Remove common tracking params + fragments to reduce duplicates."""
+    url = (url or "").strip()
+    if not url:
+        return ""
+    try:
+        parts = urlsplit(url)
+        query = [
+            (k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+            if k.lower() not in TRACKING_PARAMS
+        ]
+        clean = parts._replace(query=urlencode(query, doseq=True), fragment="")
+        return urlunsplit(clean)
+    except Exception:
+        return url
+
+def domain_of(url: str) -> str:
+    try:
+        return urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+
+def norm_title(title: str) -> str:
+    t = (title or "").strip().lower()
+    t = re.sub(r"\s+", " ", t)
+    return t
+
+def title_domain_hash(title: str, domain: str) -> str:
+    key = f"{norm_title(title)}|{(domain or '').lower()}"
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()
+
+# ----------------------------
+# Source classification (credibility buckets)
+# ----------------------------
+
+INSTITUTIONAL_DOMAINS = {
+    "eur-lex.europa.eu",
+    "environment.ec.europa.eu",
+    "ec.europa.eu",
+    "echa.europa.eu",
+    "www.europarl.europa.eu",
+    "www.eea.europa.eu",
+    "european-union.europa.eu",
+}
+
+MAINSTREAM_MEDIA_HINTS = {
+    "reuters.com", "bbc.co.uk", "lemonde.fr", "ft.com", "theguardian.com",
+    "politico.eu", "euractiv.com", "bloomberg.com", "wsj.com", "nytimes.com"
+}
+
+TRADE_MEDIA_HINTS = {
+    "packagingeurope.com", "packworld.com", "packagingdigest.com",
+    "sustainablebrands.com"
+}
+
+NGO_HINTS = {
+    "zerowasteeurope.eu", "ellenmacarthurfoundation.org", "wwf.org",
+    "greenpeace.org"
+}
+
+def classify_source_type(source: str, url: str) -> str:
+    dom = domain_of(url)
+    if source == "Official" or dom in INSTITUTIONAL_DOMAINS or dom.endswith(".europa.eu"):
+        return "Institutional"
+    if any(h in dom for h in MAINSTREAM_MEDIA_HINTS):
+        return "Mainstream media"
+    if any(h in dom for h in TRADE_MEDIA_HINTS):
+        return "Trade media"
+    if any(h in dom for h in NGO_HINTS):
+        return "NGO / civil society"
+    return "Other"
 
 # ----------------------------
 # DB
@@ -82,28 +191,45 @@ def db_connect(db_path: str) -> sqlite3.Connection:
     con.execute("PRAGMA synchronous=NORMAL;")
     return con
 
+def _try_exec(con: sqlite3.Connection, sql: str) -> None:
+    try:
+        con.execute(sql)
+        con.commit()
+    except Exception:
+        pass
+
 def init_db(con: sqlite3.Connection) -> None:
+    # New schema includes url_norm + title_domain_hash + source_type for better dedupe & categorization
     con.execute("""
     CREATE TABLE IF NOT EXISTS documents (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         source TEXT NOT NULL,
-        url TEXT NOT NULL UNIQUE,
+        source_type TEXT,
+        url TEXT NOT NULL,
+        url_norm TEXT NOT NULL UNIQUE,
         domain TEXT,
         title TEXT,
+        title_dom_hash TEXT,
         published_at TEXT,
         collected_at TEXT NOT NULL,
         text TEXT
     );
     """)
-    con.execute("CREATE INDEX IF NOT EXISTS idx_docs_source ON documents(source);")
-    con.execute("CREATE INDEX IF NOT EXISTS idx_docs_published ON documents(published_at);")
+    _try_exec(con, "CREATE INDEX IF NOT EXISTS idx_docs_source ON documents(source);")
+    _try_exec(con, "CREATE INDEX IF NOT EXISTS idx_docs_source_type ON documents(source_type);")
+    _try_exec(con, "CREATE INDEX IF NOT EXISTS idx_docs_published ON documents(published_at);")
+    _try_exec(con, "CREATE INDEX IF NOT EXISTS idx_docs_domain ON documents(domain);")
+    _try_exec(con, "CREATE INDEX IF NOT EXISTS idx_docs_titlehash ON documents(title_dom_hash);")
     con.commit()
 
-def domain_of(url: str) -> str:
-    try:
-        return urlparse(url).netloc.lower()
-    except Exception:
-        return ""
+    # Light migration for old DBs (if table existed without new columns)
+    # SQLite "ADD COLUMN" without IF NOT EXISTS: use try/except.
+    _try_exec(con, "ALTER TABLE documents ADD COLUMN source_type TEXT;")
+    _try_exec(con, "ALTER TABLE documents ADD COLUMN url_norm TEXT;")
+    _try_exec(con, "ALTER TABLE documents ADD COLUMN title_dom_hash TEXT;")
+    # Add unique index on url_norm if column exists (won't overwrite existing constraints)
+    _try_exec(con, "CREATE UNIQUE INDEX IF NOT EXISTS uq_docs_url_norm ON documents(url_norm);")
+    _try_exec(con, "CREATE INDEX IF NOT EXISTS idx_docs_titlehash ON documents(title_dom_hash);")
 
 def insert_doc(
     con: sqlite3.Connection,
@@ -116,26 +242,45 @@ def insert_doc(
     url = (url or "").strip()
     if not url:
         return False
+
+    url_norm = normalize_url(url)
+    dom = domain_of(url_norm)
+    s_type = classify_source_type(source, url_norm)
+    t_hash = title_domain_hash(title, dom)
+
+    # Secondary dedupe: if we've already seen same (title+domain), skip.
+    try:
+        cur = con.execute(
+            "SELECT 1 FROM documents WHERE title_dom_hash=? LIMIT 1;",
+            (t_hash,)
+        )
+        if cur.fetchone() is not None:
+            return True
+    except Exception:
+        pass
+
     try:
         con.execute(
             """
             INSERT OR IGNORE INTO documents
-              (source, url, domain, title, published_at, collected_at, text)
-            VALUES (?, ?, ?, ?, ?, ?, ?);
+              (source, source_type, url, url_norm, domain, title, title_dom_hash, published_at, collected_at, text)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """,
             (
                 source,
+                s_type,
                 url,
-                domain_of(url),
+                url_norm,
+                dom,
                 (title or "").strip(),
+                t_hash,
                 published_at.astimezone(timezone.utc).isoformat() if published_at else None,
                 datetime.now(timezone.utc).isoformat(),
                 (text or "").strip(),
             ),
         )
         con.commit()
-        # True if exists (inserted now or already existed)
-        cur = con.execute("SELECT 1 FROM documents WHERE url=? LIMIT 1;", (url,))
+        cur = con.execute("SELECT 1 FROM documents WHERE url_norm=? LIMIT 1;", (url_norm,))
         return cur.fetchone() is not None
     except Exception:
         return False
@@ -144,7 +289,7 @@ def load_docs(con: sqlite3.Connection, days: int = 180, limit: int = 5000) -> pd
     since = datetime.now(timezone.utc) - timedelta(days=days)
     cur = con.execute(
         """
-        SELECT source, url, domain, title, published_at, collected_at, text
+        SELECT source, source_type, url, url_norm, domain, title, published_at, collected_at, text
         FROM documents
         WHERE (published_at IS NULL) OR (published_at >= ?)
         ORDER BY COALESCE(published_at, collected_at) DESC
@@ -153,7 +298,10 @@ def load_docs(con: sqlite3.Connection, days: int = 180, limit: int = 5000) -> pd
         (since.isoformat(), limit),
     )
     rows = cur.fetchall()
-    df = pd.DataFrame(rows, columns=["source", "url", "domain", "title", "published_at", "collected_at", "text"])
+    df = pd.DataFrame(
+        rows,
+        columns=["source", "source_type", "url", "url_norm", "domain", "title", "published_at", "collected_at", "text"]
+    )
     df["published_at"] = pd.to_datetime(df["published_at"], errors="coerce", utc=True)
     df["collected_at"] = pd.to_datetime(df["collected_at"], errors="coerce", utc=True)
     return df
@@ -196,11 +344,10 @@ def parse_date_any(s: str) -> Optional[datetime]:
         return None
 
 # ----------------------------
-# GDELT (fixed: auto-retries + fallback)
+# GDELT (auto-retries + fallback)
 # ----------------------------
 
 def build_gdelt_query(keywords: List[str]) -> str:
-    # Quote phrases, leave single words. Limit to avoid overly long queries.
     terms = []
     for k in keywords:
         k = k.strip()
@@ -231,15 +378,14 @@ def gdelt_call(params: Dict) -> Tuple[List[Dict], Dict]:
 
 def gdelt_request(query: str, days: int, max_records: int) -> Tuple[List[Dict], Dict]:
     """
-    Try in order:
-      1) user date window (capped to 90)
+    Try:
+      1) user window (<=90)
       2) retry with 90 days
-      3) retry without dates (let GDELT decide)
+      3) retry without dates
     """
     days = max(1, min(int(days), 90))
     end = datetime.now(timezone.utc)
 
-    # 1) user window
     start = end - timedelta(days=days)
     p1 = {
         "query": query,
@@ -254,7 +400,6 @@ def gdelt_request(query: str, days: int, max_records: int) -> Tuple[List[Dict], 
     if len(a1) > 0:
         return a1, d1
 
-    # 2) 90-day retry
     if days < 90:
         start90 = end - timedelta(days=90)
         p2 = dict(p1)
@@ -265,7 +410,6 @@ def gdelt_request(query: str, days: int, max_records: int) -> Tuple[List[Dict], 
         if len(a2) > 0:
             return a2, d1
 
-    # 3) no dates
     p3 = {
         "query": query,
         "mode": "ArtList",
@@ -288,9 +432,8 @@ def collect_gdelt(
     query = build_gdelt_query(keywords)
     articles, debug = gdelt_request(query=query, days=days, max_records=max_records)
 
-    # Fallback query if still 0
     if len(articles) == 0:
-        fallback_query = "packaging waste EU OR PPWR OR sustainable packaging Europe"
+        fallback_query = "packaging waste EU OR PPWR OR sustainable packaging Europe OR EPR packaging"
         a2, d2 = gdelt_request(query=fallback_query, days=days, max_records=max_records)
         debug["fallback_query"] = fallback_query
         debug["fallback_debug"] = d2
@@ -313,7 +456,6 @@ def collect_gdelt(
             except Exception:
                 published_at = None
 
-        # Fast mode: store title as text; optional full text for first N
         text = title
         if fetch_full_text and idx <= budget and url:
             try:
@@ -333,7 +475,7 @@ def collect_gdelt(
     return inserted, seen, extracted_ok, debug
 
 # ----------------------------
-# RSS (fast + reliable)
+# RSS
 # ----------------------------
 
 def collect_rss(
@@ -341,15 +483,22 @@ def collect_rss(
     feed_urls: List[str],
     fetch_full_text: bool,
     max_per_feed: int,
-) -> Tuple[int, int, int]:
+) -> Tuple[int, int, int, int]:
     inserted = 0
+    feeds_ok = 0
     entries_seen = 0
     extracted_ok = 0
 
     for feed_url in [u.strip() for u in feed_urls if u.strip()]:
-        d = feedparser.parse(feed_url)
-        entries = d.entries or []
-        entries_seen += len(entries)
+        try:
+            d = feedparser.parse(feed_url)
+            if not getattr(d, "entries", None):
+                continue
+            feeds_ok += 1
+            entries = d.entries or []
+            entries_seen += len(entries)
+        except Exception:
+            continue
 
         for e in entries[: int(max_per_feed)]:
             url = (getattr(e, "link", "") or "").strip()
@@ -385,7 +534,7 @@ def collect_rss(
             if insert_doc(con, "RSS", url, title, published_at, text):
                 inserted += 1
 
-    return inserted, entries_seen, extracted_ok
+    return inserted, feeds_ok, entries_seen, extracted_ok
 
 # ----------------------------
 # GNews library (extra news source)
@@ -399,10 +548,6 @@ def collect_gnews(
     language: str,
     max_results: int,
 ) -> Tuple[int, int]:
-    """
-    Uses gnews library to fetch results similar to your example.
-    Stores title/description as text for speed.
-    """
     if GNews is None:
         return 0, 0
 
@@ -417,7 +562,6 @@ def collect_gnews(
         max_results=int(max_results),
     )
 
-    # Keep topics small so it's fast
     topics = keywords[:6] if keywords else ["packaging waste", "PPWR", "sustainable packaging"]
     inserted = 0
     seen = 0
@@ -495,11 +639,12 @@ def top_terms(df: pd.DataFrame, n: int = 25) -> pd.DataFrame:
 def simple_signals(df: pd.DataFrame) -> pd.DataFrame:
     buckets = {
         "Compliance / enforcement": ["compliance", "enforcement", "penalty", "fine", "obligation", "deadline"],
-        "Cost / supply": ["cost", "price", "supply", "shortage", "logistics"],
+        "Cost / supply": ["cost", "price", "supply", "shortage", "logistics", "inflation"],
         "Reuse / refill": ["reuse", "reusable", "refill", "return", "deposit"],
         "Recycling / recycled content": ["recycle", "recyclable", "recycled", "content"],
         "Chemicals (PFAS etc.)": ["pfas", "bpa", "chemical"],
-        "Labeling / greenwashing": ["label", "labels", "claim", "greenwashing"],
+        "Labeling / greenwashing": ["label", "labels", "claim", "greenwashing", "misleading"],
+        "Targets / bans": ["ban", "banned", "target", "quota", "mandatory"],
     }
 
     counts = {k: 0 for k in buckets}
@@ -512,27 +657,57 @@ def simple_signals(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(sorted(counts.items(), key=lambda x: x[1], reverse=True), columns=["signal", "count"])
     return out[out["count"] > 0]
 
+def emerging_terms(df: pd.DataFrame, window_days: int = 30, top_n: int = 15, min_recent: int = 3) -> pd.DataFrame:
+    """Terms that increase in the last window vs previous window (simple weak-signal proxy)."""
+    if df.empty:
+        return pd.DataFrame()
+
+    ts = df["published_at"].fillna(df["collected_at"])
+    now = ts.max()
+    if pd.isna(now):
+        return pd.DataFrame()
+
+    recent_start = now - pd.Timedelta(days=window_days)
+    prev_start = now - pd.Timedelta(days=2 * window_days)
+
+    recent = df[ts >= recent_start]
+    prev = df[(ts < recent_start) & (ts >= prev_start)]
+
+    from collections import Counter
+    cr, cp = Counter(), Counter()
+
+    for t in recent["text"].fillna("").astype(str):
+        cr.update(tokenize(t))
+    for t in prev["text"].fillna("").astype(str):
+        cp.update(tokenize(t))
+
+    rows = []
+    for term, rc in cr.items():
+        pc = cp.get(term, 0)
+        if rc >= min_recent:
+            rows.append((term, rc, pc, rc - pc))
+    out = pd.DataFrame(rows, columns=["term", "recent", "previous", "delta"]).sort_values("delta", ascending=False)
+    return out.head(top_n)
 
 # ============================
 # Streamlit UI (3 tabs)
 # ============================
 
-st.set_page_config(page_title="Packaging Trends Monitor", layout="wide")
-st.title("📦 Packaging Trends Monitor")
-st.caption("Collect packaging trend info (GDELT + RSS + GNews + official), explore it, and analyze key signals.")
+st.set_page_config(page_title="GreenPack Analytics – Scanning", layout="wide")
+st.title("📦 GreenPack Analytics – Strategic Scanning Monitor")
+st.caption("Collect packaging sustainability signals (GDELT + RSS + GNews + Official), explore them, and detect emerging issues.")
 
 with st.sidebar:
-
     db_path = DEFAULT_DB
     con = db_connect(db_path)
     init_db(con)
 
     st.subheader("Keywords")
-    keywords_text = st.text_area("One per line", "\n".join(DEFAULT_KEYWORDS), height=150)
+    keywords_text = st.text_area("One per line", "\n".join(DEFAULT_KEYWORDS), height=160)
     keywords = [k.strip() for k in keywords_text.splitlines() if k.strip()]
 
     st.subheader("Collect windows")
-    lookback_days = st.slider("Lookback days (news)", 7, 365, 180)
+    lookback_days = st.slider("Lookback days (GNews)", 7, 365, 180)
 
     st.subheader("GDELT settings")
     gdelt_days = st.slider("GDELT date window (auto-retries anyway)", 7, 90, 30)
@@ -541,24 +716,23 @@ with st.sidebar:
     gdelt_full_text_n = st.slider("GDELT full-text limit", 0, 60, 15)
 
     st.subheader("RSS feeds (one per line)")
-    rss_text = st.text_area("RSS URLs", "\n".join(DEFAULT_RSS_FEEDS), height=140)
+    rss_text = st.text_area("RSS URLs", "\n".join(DEFAULT_RSS_FEEDS), height=180)
     rss_feeds = [u.strip() for u in rss_text.splitlines() if u.strip()]
     rss_full_text = st.checkbox("RSS: fetch full article text (slower)", value=False)
     rss_max_per_feed = st.slider("RSS max items per feed", 5, 60, 25)
 
     st.subheader("GNews (optional extra)")
     use_gnews = st.checkbox("Enable GNews source", value=True)
-    gnews_country = st.text_input("GNews country (2 letters)", "EU")
+    st.caption("Tip: 'EU' may not work for all setups; FR/DE/GB are safer.")
+    gnews_country = st.text_input("GNews country (2 letters)", "FR")
     gnews_language = st.text_input("GNews language (2 letters)", "en")
     gnews_max = st.slider("GNews max results per topic", 10, 100, 50, step=10)
 
-    st.subheader("Official URLs (one per line)")
-    official_text = st.text_area("Official URLs", "\n".join(DEFAULT_OFFICIAL_URLS), height=110)
+    st.subheader("Official Watchlist (one per line)")
+    official_text = st.text_area("Official URLs", "\n".join(DEFAULT_OFFICIAL_URLS), height=160)
     official_urls = [u.strip() for u in official_text.splitlines() if u.strip()]
 
-
 tab_collect, tab_explore, tab_analyze = st.tabs(["Collect data", "Explore data", "Analyze (Dashboard)"])
-
 
 with tab_collect:
     st.subheader("Collect data")
@@ -587,19 +761,17 @@ with tab_collect:
                 )
                 total_inserted += ins
                 st.success(f"✅ GDELT seen {seen} | extracted {extracted_ok} | inserted {ins}")
-                # with st.expander("GDELT debug (open if seen=0)"):
-                #     st.json(debug)
 
         if do_rss:
             with st.spinner("Collecting from RSS…"):
-                ins, entries_seen, extracted_ok = collect_rss(
+                ins, feeds_ok, entries_seen, extracted_ok = collect_rss(
                     con,
                     feed_urls=rss_feeds,
                     fetch_full_text=rss_full_text,
                     max_per_feed=rss_max_per_feed,
                 )
                 total_inserted += ins
-                st.success(f"✅ RSS entries seen {entries_seen} | extracted {extracted_ok} | inserted {ins}")
+                st.success(f"✅ RSS feeds OK {feeds_ok} | entries seen {entries_seen} | extracted {extracted_ok} | inserted {ins}")
 
         if do_gnews and use_gnews and GNews is not None:
             with st.spinner("Collecting from GNews…"):
@@ -607,8 +779,8 @@ with tab_collect:
                     con,
                     keywords=keywords,
                     lookback_days=lookback_days,
-                    country=gnews_country.strip() or "EU",
-                    language=gnews_language.strip() or "en",
+                    country=(gnews_country.strip() or "FR"),
+                    language=(gnews_language.strip() or "en"),
                     max_results=gnews_max,
                 )
                 total_inserted += ins
@@ -624,14 +796,14 @@ with tab_collect:
             st.warning(
                 "No new documents inserted. Try:\n"
                 "- Increase lookback days\n"
-                "- Use broader keywords like: 'packaging waste', 'sustainable packaging'\n"
-                "- Turn ON GNews + RSS (they usually always return items)"
+                "- Use broader keywords: 'packaging waste', 'PPWR'\n"
+                "- Keep full-text OFF for speed\n"
+                "- Add/replace RSS feeds if some are dead"
             )
         else:
             st.success(f"Done — inserted {total_inserted} documents.")
 
-    st.info("Fast mode tip: keep full-text OFF. Titles/summaries are enough for trend dashboards.")
-
+    st.info("Fast mode tip: keep full-text OFF. Titles/summaries are often enough for scanning dashboards.")
 
 with tab_explore:
     st.subheader("Explore data")
@@ -642,12 +814,18 @@ with tab_explore:
         st.info("No data yet. Go to **Collect data** first.")
     else:
         sources = ["All"] + sorted(df["source"].dropna().unique().tolist())
-        pick_source = st.selectbox("Filter by source", sources, index=0)
-        q = st.text_input("Search in title/text", value="")
+        types = ["All"] + sorted(df["source_type"].dropna().unique().tolist())
+
+        c1, c2, c3 = st.columns([1, 1, 2])
+        pick_source = c1.selectbox("Filter by source", sources, index=0)
+        pick_type = c2.selectbox("Filter by source type", types, index=0)
+        q = c3.text_input("Search in title/text", value="")
 
         view = df.copy()
         if pick_source != "All":
             view = view[view["source"] == pick_source]
+        if pick_type != "All":
+            view = view[view["source_type"] == pick_type]
         if q.strip():
             qq = q.strip().lower()
             view = view[
@@ -660,7 +838,7 @@ with tab_explore:
         show["collected_at"] = show["collected_at"].dt.strftime("%Y-%m-%d %H:%M").fillna("")
 
         st.dataframe(
-            show[["source", "published_at", "domain", "title", "url"]],
+            show[["source_type", "source", "published_at", "domain", "title", "url"]],
             use_container_width=True,
             hide_index=True,
         )
@@ -668,10 +846,9 @@ with tab_explore:
         st.download_button(
             "⬇️ Download CSV",
             data=view.to_csv(index=False).encode("utf-8"),
-            file_name="packaging_trends_export.csv",
+            file_name="greenpack_scanning_export.csv",
             mime="text/csv",
         )
-
 
 with tab_analyze:
     st.subheader("Analyze (Dashboard)")
@@ -697,9 +874,20 @@ with tab_analyze:
         by_source = df["source"].value_counts().rename_axis("source").reset_index(name="count")
         st.bar_chart(by_source.set_index("source")["count"])
 
+        st.write("### By credibility category (source type)")
+        by_type = df["source_type"].fillna("Other").value_counts().rename_axis("source_type").reset_index(name="count")
+        st.bar_chart(by_type.set_index("source_type")["count"])
+
         st.write("### Top terms (what people talk about most)")
         terms = top_terms(df, n=25)
         st.dataframe(terms, use_container_width=True)
+
+        st.write("### Emerging terms (weak signals) — last 30 days vs previous 30 days")
+        emerg = emerging_terms(df, window_days=30, top_n=15, min_recent=3)
+        if emerg.empty:
+            st.info("Not enough data yet for emerging terms. Collect more items or increase the analysis window.")
+        else:
+            st.dataframe(emerg, use_container_width=True)
 
         st.write("### Signals (concerns / expectations buckets)")
         sig = simple_signals(df)
@@ -712,4 +900,13 @@ with tab_analyze:
         st.write("### Recent items")
         recent = df.head(20).copy()
         recent["published_at"] = recent["published_at"].dt.strftime("%Y-%m-%d %H:%M").fillna("")
-        st.dataframe(recent[["source", "published_at", "title", "url"]], use_container_width=True, hide_index=True)
+        st.dataframe(
+            recent[["source_type", "source", "published_at", "title", "url"]],
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.caption(
+            "Method note: This dashboard supports strategic scanning by combining (1) multi-source collection, "
+            "(2) credibility categories, (3) topic/term summaries, and (4) emerging-term detection as a weak-signal proxy."
+        )
