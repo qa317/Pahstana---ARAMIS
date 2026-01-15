@@ -1,15 +1,21 @@
-# app.py (REVISED)
-# 3 tabs: Collect data / Explore data / Analyze (Dashboard)
-# Improvements included:
-#   ✅ Source diversification (adds non-Google RSS feeds + keeps Google News RSS)
-#   ✅ Expanded "Official Watchlist" (more EU/institutional pages by default)
-#   ✅ URL normalization (removes tracking params → better deduplication)
-#   ✅ Secondary dedupe (title+domain hash) to reduce near-duplicates
-#   ✅ Source credibility categories (Institutional / Mainstream / Trade / NGO / Other)
-#   ✅ Emerging signals (terms increasing in last X days vs previous period)
+# app.py (UPDATED for Streamlit Cloud)
+# ✅ Adds Reddit collection (via Reddit RSS — no API keys needed)
+# ✅ Adds Sentiment Analysis (VADER via vaderSentiment — lightweight, Streamlit Cloud friendly)
+# ✅ Improves analysis: sentiment over time, sentiment by source type, key insights summary
+# ✅ Keeps: GDELT + RSS + GNews + Official pages + Emerging terms + Signal buckets
 #
-# Run:
-#   pip install streamlit requests feedparser pandas beautifulsoup4 python-dateutil gnews
+# requirements.txt (recommended for Streamlit Cloud):
+# streamlit
+# requests
+# feedparser
+# pandas
+# beautifulsoup4
+# python-dateutil
+# vaderSentiment
+# gnews
+#
+# Run locally:
+#   pip install -r requirements.txt
 #   streamlit run app.py
 
 from __future__ import annotations
@@ -19,7 +25,7 @@ import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse, urlsplit, urlunsplit, parse_qsl, urlencode
+from urllib.parse import urlparse, urlsplit, urlunsplit, parse_qsl, urlencode, quote_plus
 
 import pandas as pd
 import requests
@@ -27,6 +33,8 @@ import streamlit as st
 import feedparser
 from bs4 import BeautifulSoup
 from dateutil import parser as dtparser
+
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 # Optional: GNews library
 try:
@@ -56,9 +64,7 @@ DEFAULT_KEYWORDS = [
     "greenwashing packaging",
 ]
 
-# Google News RSS queries (reliable) + a few direct feeds (diversify).
-# NOTE: Some publishers change RSS endpoints over time. If a feed stops working,
-# remove it or replace it (the app will safely skip failing feeds).
+# Google News RSS queries + diversified direct feeds
 DEFAULT_RSS_FEEDS = [
     # --- Google News RSS (broad coverage) ---
     "https://news.google.com/rss/search?q=packaging%20waste%20EU&hl=en&gl=FR&ceid=FR:en",
@@ -68,31 +74,31 @@ DEFAULT_RSS_FEEDS = [
     "https://news.google.com/rss/search?q=EPR%20packaging%20Europe&hl=en&gl=FR&ceid=FR:en",
     "https://news.google.com/rss/search?q=PFAS%20packaging%20Europe&hl=en&gl=FR&ceid=FR:en",
     # --- Direct / sector feeds (diversification) ---
-    # Packaging industry media (often has RSS, but endpoints can change)
     "https://packagingeurope.com/feed/",
-    # NGOs / civil society (signal source)
     "https://zerowasteeurope.eu/feed/",
-    # Think tank / circular economy ecosystem
     "https://www.ellenmacarthurfoundation.org/feeds/latest",
-    # European Commission press corner (often stable, but can change)
     "https://ec.europa.eu/commission/presscorner/api/rss?language=en",
 ]
 
-# Expanded "Official Watchlist" (more institutional coverage)
+# Expanded institutional watchlist
 DEFAULT_OFFICIAL_URLS = [
-    # European Commission topic page (packaging waste)
     "https://environment.ec.europa.eu/topics/waste-and-recycling/packaging-waste_en",
-    # Eur-Lex regulation page (you already had this)
     "https://eur-lex.europa.eu/eli/reg/2025/40/oj/eng",
-    # EUR-Lex page for waste policy area (broad legal scanning entry point)
-    "https://eur-lex.europa.eu/browse/directories/legislation.html?lang=en",
-    # European Parliament: environment / waste (broad institutional signals)
-    "https://www.europarl.europa.eu/topics/en/article/20190110STO23109/waste-and-recycling",
-    # ECHA: PFAS topic landing page (chemicals in packaging discussions)
-    "https://echa.europa.eu/hot-topics/perfluoroalkyl-chemicals-pfas",
-    # European Environment Agency: waste topic
     "https://www.eea.europa.eu/themes/waste",
+    "https://echa.europa.eu/hot-topics/perfluoroalkyl-chemicals-pfas",
+    "https://www.europarl.europa.eu/topics/en/article/20190110STO23109/waste-and-recycling",
 ]
+
+# Reddit RSS defaults (no API keys needed)
+DEFAULT_REDDIT_SUBREDDITS = [
+    "sustainability",
+    "environment",
+    "ZeroWaste",
+    "packaging",
+    "circularEconomy",
+    "europe",
+]
+DEFAULT_REDDIT_QUERY = "packaging OR PPWR OR reusable packaging OR recyclable packaging OR PFAS packaging OR EPR packaging"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; GreenPackAnalytics/1.0; +https://example.com)",
@@ -110,7 +116,6 @@ TRACKING_PARAMS = {
 }
 
 def normalize_url(url: str) -> str:
-    """Remove common tracking params + fragments to reduce duplicates."""
     url = (url or "").strip()
     if not url:
         return ""
@@ -153,26 +158,24 @@ INSTITUTIONAL_DOMAINS = {
     "www.eea.europa.eu",
     "european-union.europa.eu",
 }
-
 MAINSTREAM_MEDIA_HINTS = {
     "reuters.com", "bbc.co.uk", "lemonde.fr", "ft.com", "theguardian.com",
-    "politico.eu", "euractiv.com", "bloomberg.com", "wsj.com", "nytimes.com"
+    "politico.eu", "euractiv.com", "bloomberg.com"
 }
-
 TRADE_MEDIA_HINTS = {
     "packagingeurope.com", "packworld.com", "packagingdigest.com",
     "sustainablebrands.com"
 }
-
 NGO_HINTS = {
-    "zerowasteeurope.eu", "ellenmacarthurfoundation.org", "wwf.org",
-    "greenpeace.org"
+    "zerowasteeurope.eu", "ellenmacarthurfoundation.org", "wwf.org", "greenpeace.org"
 }
 
 def classify_source_type(source: str, url: str) -> str:
     dom = domain_of(url)
     if source == "Official" or dom in INSTITUTIONAL_DOMAINS or dom.endswith(".europa.eu"):
         return "Institutional"
+    if source == "Reddit":
+        return "Online discourse"
     if any(h in dom for h in MAINSTREAM_MEDIA_HINTS):
         return "Mainstream media"
     if any(h in dom for h in TRADE_MEDIA_HINTS):
@@ -180,6 +183,25 @@ def classify_source_type(source: str, url: str) -> str:
     if any(h in dom for h in NGO_HINTS):
         return "NGO / civil society"
     return "Other"
+
+# ----------------------------
+# Sentiment (VADER)
+# ----------------------------
+
+SENTI = SentimentIntensityAnalyzer()
+
+def sentiment_compound(text: str) -> float:
+    text = (text or "").strip()
+    if not text:
+        return 0.0
+    return float(SENTI.polarity_scores(text)["compound"])
+
+def sentiment_label(comp: float) -> str:
+    if comp >= 0.05:
+        return "Positive"
+    if comp <= -0.05:
+        return "Negative"
+    return "Neutral"
 
 # ----------------------------
 # DB
@@ -199,7 +221,6 @@ def _try_exec(con: sqlite3.Connection, sql: str) -> None:
         pass
 
 def init_db(con: sqlite3.Connection) -> None:
-    # New schema includes url_norm + title_domain_hash + source_type for better dedupe & categorization
     con.execute("""
     CREATE TABLE IF NOT EXISTS documents (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -212,24 +233,26 @@ def init_db(con: sqlite3.Connection) -> None:
         title_dom_hash TEXT,
         published_at TEXT,
         collected_at TEXT NOT NULL,
-        text TEXT
+        text TEXT,
+        sentiment_compound REAL,
+        sentiment_label TEXT
     );
     """)
+    _try_exec(con, "CREATE UNIQUE INDEX IF NOT EXISTS uq_docs_url_norm ON documents(url_norm);")
     _try_exec(con, "CREATE INDEX IF NOT EXISTS idx_docs_source ON documents(source);")
     _try_exec(con, "CREATE INDEX IF NOT EXISTS idx_docs_source_type ON documents(source_type);")
     _try_exec(con, "CREATE INDEX IF NOT EXISTS idx_docs_published ON documents(published_at);")
     _try_exec(con, "CREATE INDEX IF NOT EXISTS idx_docs_domain ON documents(domain);")
     _try_exec(con, "CREATE INDEX IF NOT EXISTS idx_docs_titlehash ON documents(title_dom_hash);")
-    con.commit()
+    _try_exec(con, "CREATE INDEX IF NOT EXISTS idx_docs_sentiment ON documents(sentiment_compound);")
 
-    # Light migration for old DBs (if table existed without new columns)
-    # SQLite "ADD COLUMN" without IF NOT EXISTS: use try/except.
+    # Migration for older DBs:
     _try_exec(con, "ALTER TABLE documents ADD COLUMN source_type TEXT;")
     _try_exec(con, "ALTER TABLE documents ADD COLUMN url_norm TEXT;")
     _try_exec(con, "ALTER TABLE documents ADD COLUMN title_dom_hash TEXT;")
-    # Add unique index on url_norm if column exists (won't overwrite existing constraints)
-    _try_exec(con, "CREATE UNIQUE INDEX IF NOT EXISTS uq_docs_url_norm ON documents(url_norm);")
-    _try_exec(con, "CREATE INDEX IF NOT EXISTS idx_docs_titlehash ON documents(title_dom_hash);")
+    _try_exec(con, "ALTER TABLE documents ADD COLUMN sentiment_compound REAL;")
+    _try_exec(con, "ALTER TABLE documents ADD COLUMN sentiment_label TEXT;")
+    con.commit()
 
 def insert_doc(
     con: sqlite3.Connection,
@@ -248,12 +271,14 @@ def insert_doc(
     s_type = classify_source_type(source, url_norm)
     t_hash = title_domain_hash(title, dom)
 
-    # Secondary dedupe: if we've already seen same (title+domain), skip.
+    # Sentiment on combined text (headline + body/summary)
+    combo = f"{title}. {text}".strip()
+    comp = sentiment_compound(combo)
+    label = sentiment_label(comp)
+
+    # Secondary dedupe: same title+domain
     try:
-        cur = con.execute(
-            "SELECT 1 FROM documents WHERE title_dom_hash=? LIMIT 1;",
-            (t_hash,)
-        )
+        cur = con.execute("SELECT 1 FROM documents WHERE title_dom_hash=? LIMIT 1;", (t_hash,))
         if cur.fetchone() is not None:
             return True
     except Exception:
@@ -263,8 +288,9 @@ def insert_doc(
         con.execute(
             """
             INSERT OR IGNORE INTO documents
-              (source, source_type, url, url_norm, domain, title, title_dom_hash, published_at, collected_at, text)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+              (source, source_type, url, url_norm, domain, title, title_dom_hash, published_at, collected_at, text,
+               sentiment_compound, sentiment_label)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """,
             (
                 source,
@@ -277,6 +303,8 @@ def insert_doc(
                 published_at.astimezone(timezone.utc).isoformat() if published_at else None,
                 datetime.now(timezone.utc).isoformat(),
                 (text or "").strip(),
+                comp,
+                label,
             ),
         )
         con.commit()
@@ -289,7 +317,8 @@ def load_docs(con: sqlite3.Connection, days: int = 180, limit: int = 5000) -> pd
     since = datetime.now(timezone.utc) - timedelta(days=days)
     cur = con.execute(
         """
-        SELECT source, source_type, url, url_norm, domain, title, published_at, collected_at, text
+        SELECT source, source_type, url, url_norm, domain, title, published_at, collected_at, text,
+               sentiment_compound, sentiment_label
         FROM documents
         WHERE (published_at IS NULL) OR (published_at >= ?)
         ORDER BY COALESCE(published_at, collected_at) DESC
@@ -300,14 +329,19 @@ def load_docs(con: sqlite3.Connection, days: int = 180, limit: int = 5000) -> pd
     rows = cur.fetchall()
     df = pd.DataFrame(
         rows,
-        columns=["source", "source_type", "url", "url_norm", "domain", "title", "published_at", "collected_at", "text"]
+        columns=[
+            "source", "source_type", "url", "url_norm", "domain", "title",
+            "published_at", "collected_at", "text", "sentiment_compound", "sentiment_label"
+        ],
     )
     df["published_at"] = pd.to_datetime(df["published_at"], errors="coerce", utc=True)
     df["collected_at"] = pd.to_datetime(df["collected_at"], errors="coerce", utc=True)
+    df["sentiment_compound"] = pd.to_numeric(df["sentiment_compound"], errors="coerce").fillna(0.0)
+    df["sentiment_label"] = df["sentiment_label"].fillna("Neutral")
     return df
 
 # ----------------------------
-# Extraction (fast)
+# Extraction
 # ----------------------------
 
 def fetch(url: str, timeout: int = 20) -> requests.Response:
@@ -344,7 +378,7 @@ def parse_date_any(s: str) -> Optional[datetime]:
         return None
 
 # ----------------------------
-# GDELT (auto-retries + fallback)
+# GDELT
 # ----------------------------
 
 def build_gdelt_query(keywords: List[str]) -> str:
@@ -377,12 +411,6 @@ def gdelt_call(params: Dict) -> Tuple[List[Dict], Dict]:
     return (data.get("articles", []) or []), debug
 
 def gdelt_request(query: str, days: int, max_records: int) -> Tuple[List[Dict], Dict]:
-    """
-    Try:
-      1) user window (<=90)
-      2) retry with 90 days
-      3) retry without dates
-    """
     days = max(1, min(int(days), 90))
     end = datetime.now(timezone.utc)
 
@@ -537,7 +565,64 @@ def collect_rss(
     return inserted, feeds_ok, entries_seen, extracted_ok
 
 # ----------------------------
-# GNews library (extra news source)
+# Reddit (via RSS)
+# ----------------------------
+
+def build_reddit_rss(subreddit: str, query: str, sort: str = "new") -> str:
+    # Example:
+    # https://www.reddit.com/r/sustainability/search.rss?q=packaging&restrict_sr=1&sort=new
+    return (
+        f"https://www.reddit.com/r/{subreddit}/search.rss?"
+        f"q={quote_plus(query)}&restrict_sr=1&sort={sort}&t=all"
+    )
+
+def collect_reddit_rss(
+    con: sqlite3.Connection,
+    subreddits: List[str],
+    query: str,
+    max_per_sub: int,
+) -> Tuple[int, int, int]:
+    inserted = 0
+    entries_seen = 0
+    extracted_ok = 0
+
+    for sr in [s.strip() for s in subreddits if s.strip()]:
+        rss_url = build_reddit_rss(sr, query=query, sort="new")
+        try:
+            d = feedparser.parse(rss_url)
+            entries = d.entries or []
+            entries_seen += len(entries)
+        except Exception:
+            continue
+
+        for e in entries[: int(max_per_sub)]:
+            url = (getattr(e, "link", "") or "").strip()
+            title = (getattr(e, "title", "") or "").strip()
+
+            published_at = None
+            if getattr(e, "published", None):
+                published_at = parse_date_any(getattr(e, "published", ""))
+
+            # RSS summary often contains HTML; keep it as "discourse snippet"
+            summary_html = (getattr(e, "summary", "") or "").strip()
+            summary_text = re.sub(
+                r"\s+",
+                " ",
+                BeautifulSoup(summary_html, "html.parser").get_text(" ", strip=True),
+            )
+
+            # Keep it short, but informative (avoid huge blobs)
+            text = summary_text[:2000] if summary_text else title
+
+            if text:
+                extracted_ok += 1
+            if insert_doc(con, "Reddit", url, title, published_at, text):
+                inserted += 1
+
+    return inserted, entries_seen, extracted_ok
+
+# ----------------------------
+# GNews library (optional)
 # ----------------------------
 
 def collect_gnews(
@@ -590,10 +675,7 @@ def collect_gnews(
 # Official pages
 # ----------------------------
 
-def collect_official(
-    con: sqlite3.Connection,
-    urls: List[str],
-) -> Tuple[int, int]:
+def collect_official(con: sqlite3.Connection, urls: List[str]) -> Tuple[int, int]:
     inserted = 0
     extracted_ok = 0
     for url in [u.strip() for u in urls if u.strip()]:
@@ -612,7 +694,7 @@ def collect_official(
     return inserted, extracted_ok
 
 # ----------------------------
-# Analyze helpers
+# Analysis helpers
 # ----------------------------
 
 STOPWORDS = set("""
@@ -646,22 +728,18 @@ def simple_signals(df: pd.DataFrame) -> pd.DataFrame:
         "Labeling / greenwashing": ["label", "labels", "claim", "greenwashing", "misleading"],
         "Targets / bans": ["ban", "banned", "target", "quota", "mandatory"],
     }
-
     counts = {k: 0 for k in buckets}
     for _, row in df.iterrows():
         text = f"{row.get('title','')} {row.get('text','')}".lower()
         for b, keys in buckets.items():
             if any(k in text for k in keys):
                 counts[b] += 1
-
     out = pd.DataFrame(sorted(counts.items(), key=lambda x: x[1], reverse=True), columns=["signal", "count"])
     return out[out["count"] > 0]
 
 def emerging_terms(df: pd.DataFrame, window_days: int = 30, top_n: int = 15, min_recent: int = 3) -> pd.DataFrame:
-    """Terms that increase in the last window vs previous window (simple weak-signal proxy)."""
     if df.empty:
         return pd.DataFrame()
-
     ts = df["published_at"].fillna(df["collected_at"])
     now = ts.max()
     if pd.isna(now):
@@ -675,7 +753,6 @@ def emerging_terms(df: pd.DataFrame, window_days: int = 30, top_n: int = 15, min
 
     from collections import Counter
     cr, cp = Counter(), Counter()
-
     for t in recent["text"].fillna("").astype(str):
         cr.update(tokenize(t))
     for t in prev["text"].fillna("").astype(str):
@@ -689,13 +766,57 @@ def emerging_terms(df: pd.DataFrame, window_days: int = 30, top_n: int = 15, min
     out = pd.DataFrame(rows, columns=["term", "recent", "previous", "delta"]).sort_values("delta", ascending=False)
     return out.head(top_n)
 
+def build_key_insights(df: pd.DataFrame) -> List[str]:
+    """Create simple, defensible 'insight bullets' from the dashboard metrics."""
+    if df.empty:
+        return ["No data collected yet. Run collection first."]
+
+    bullets: List[str] = []
+
+    # 1) Source type balance
+    by_type = df["source_type"].fillna("Other").value_counts()
+    top_type = by_type.index[0]
+    top_type_share = (by_type.iloc[0] / len(df)) * 100
+    bullets.append(f"Coverage is dominated by **{top_type}** sources (~{top_type_share:.0f}% of documents).")
+
+    # 2) Signals
+    sig = simple_signals(df)
+    if not sig.empty:
+        top_sig = sig.iloc[0]
+        bullets.append(f"Top recurring theme: **{top_sig['signal']}** (mentions: {int(top_sig['count'])}).")
+
+    # 3) Emerging terms
+    emerg = emerging_terms(df, window_days=30, top_n=5, min_recent=3)
+    if not emerg.empty:
+        rising = ", ".join([f"{r.term} (+{int(r.delta)})" for r in emerg.itertuples(index=False)])
+        bullets.append(f"Emerging terms (last 30d vs previous 30d): {rising}.")
+
+    # 4) Sentiment summary
+    avg_sent = df["sentiment_compound"].mean()
+    bullets.append(f"Overall tone is **{sentiment_label(avg_sent)}** (avg VADER compound: {avg_sent:.2f}).")
+
+    # 5) Sentiment differences by source type
+    if df["source_type"].nunique() >= 2:
+        g = df.groupby("source_type")["sentiment_compound"].mean().sort_values()
+        low = g.index[0]
+        high = g.index[-1]
+        bullets.append(
+            f"Tone differs by source type: lowest average in **{low}** ({g.iloc[0]:.2f}), highest in **{high}** ({g.iloc[-1]:.2f})."
+        )
+
+    # 6) Practical implication framing
+    bullets.append(
+        "Interpretation note: sentiment reflects **language in sources** (headlines/snippets), not objective policy outcomes; use it to detect **concerns and expectations**, not to forecast."
+    )
+    return bullets
+
 # ============================
-# Streamlit UI (3 tabs)
+# Streamlit UI
 # ============================
 
 st.set_page_config(page_title="GreenPack Analytics – Scanning", layout="wide")
 st.title("📦 GreenPack Analytics – Strategic Scanning Monitor")
-st.caption("Collect packaging sustainability signals (GDELT + RSS + GNews + Official), explore them, and detect emerging issues.")
+st.caption("Collect signals from media, institutions, and online discourse; detect themes, weak signals, and stakeholder sentiment.")
 
 with st.sidebar:
     db_path = DEFAULT_DB
@@ -705,9 +826,6 @@ with st.sidebar:
     st.subheader("Keywords")
     keywords_text = st.text_area("One per line", "\n".join(DEFAULT_KEYWORDS), height=160)
     keywords = [k.strip() for k in keywords_text.splitlines() if k.strip()]
-
-    st.subheader("Collect windows")
-    lookback_days = st.slider("Lookback days (GNews)", 7, 365, 180)
 
     st.subheader("GDELT settings")
     gdelt_days = st.slider("GDELT date window (auto-retries anyway)", 7, 90, 30)
@@ -721,9 +839,17 @@ with st.sidebar:
     rss_full_text = st.checkbox("RSS: fetch full article text (slower)", value=False)
     rss_max_per_feed = st.slider("RSS max items per feed", 5, 60, 25)
 
+    st.subheader("Reddit (RSS search, no API keys)")
+    use_reddit = st.checkbox("Enable Reddit source", value=True)
+    reddit_query = st.text_input("Reddit query", DEFAULT_REDDIT_QUERY)
+    reddit_subs_text = st.text_area("Subreddits (one per line)", "\n".join(DEFAULT_REDDIT_SUBREDDITS), height=120)
+    reddit_subs = [s.strip() for s in reddit_subs_text.splitlines() if s.strip()]
+    reddit_max_per_sub = st.slider("Max posts per subreddit", 5, 50, 20)
+
     st.subheader("GNews (optional extra)")
     use_gnews = st.checkbox("Enable GNews source", value=True)
-    st.caption("Tip: 'EU' may not work for all setups; FR/DE/GB are safer.")
+    lookback_days = st.slider("GNews lookback days", 7, 365, 180)
+    st.caption("Tip: 'EU' may not work everywhere; FR/DE/GB are safer.")
     gnews_country = st.text_input("GNews country (2 letters)", "FR")
     gnews_language = st.text_input("GNews language (2 letters)", "en")
     gnews_max = st.slider("GNews max results per topic", 10, 100, 50, step=10)
@@ -732,26 +858,27 @@ with st.sidebar:
     official_text = st.text_area("Official URLs", "\n".join(DEFAULT_OFFICIAL_URLS), height=160)
     official_urls = [u.strip() for u in official_text.splitlines() if u.strip()]
 
-tab_collect, tab_explore, tab_analyze = st.tabs(["Collect data", "Explore data", "Analyze (Dashboard)"])
+tab_collect, tab_explore, tab_analyze = st.tabs(["Collect data", "Explore data", "Analyze (Insights)"])
 
 with tab_collect:
     st.subheader("Collect data")
 
-    c1, c2, c3, c4 = st.columns(4)
-    do_gdelt = c1.checkbox("Collect GDELT", value=True)
-    do_rss = c2.checkbox("Collect RSS", value=True)
-    do_gnews = c3.checkbox("Collect GNews", value=True)
-    do_official = c4.checkbox("Collect Official", value=True)
+    c1, c2, c3, c4, c5 = st.columns(5)
+    do_gdelt = c1.checkbox("GDELT", value=True)
+    do_rss = c2.checkbox("RSS", value=True)
+    do_reddit = c3.checkbox("Reddit", value=True)
+    do_gnews = c4.checkbox("GNews", value=True)
+    do_official = c5.checkbox("Official", value=True)
 
     if GNews is None and do_gnews:
-        st.warning("GNews library not available. Install it with: pip install gnews")
+        st.warning("GNews library not available. Add `gnews` to requirements.txt.")
 
     if st.button("🚀 Run collection", type="primary"):
         total_inserted = 0
 
         if do_gdelt:
             with st.spinner("Collecting from GDELT…"):
-                ins, seen, extracted_ok, debug = collect_gdelt(
+                ins, seen, extracted_ok, _debug = collect_gdelt(
                     con,
                     keywords=keywords,
                     days=gdelt_days,
@@ -772,6 +899,17 @@ with tab_collect:
                 )
                 total_inserted += ins
                 st.success(f"✅ RSS feeds OK {feeds_ok} | entries seen {entries_seen} | extracted {extracted_ok} | inserted {ins}")
+
+        if do_reddit and use_reddit:
+            with st.spinner("Collecting from Reddit RSS…"):
+                ins, seen, extracted_ok = collect_reddit_rss(
+                    con,
+                    subreddits=reddit_subs,
+                    query=reddit_query,
+                    max_per_sub=reddit_max_per_sub,
+                )
+                total_inserted += ins
+                st.success(f"✅ Reddit entries seen {seen} | extracted {extracted_ok} | inserted {ins}")
 
         if do_gnews and use_gnews and GNews is not None:
             with st.spinner("Collecting from GNews…"):
@@ -795,15 +933,15 @@ with tab_collect:
         if total_inserted == 0:
             st.warning(
                 "No new documents inserted. Try:\n"
-                "- Increase lookback days\n"
-                "- Use broader keywords: 'packaging waste', 'PPWR'\n"
-                "- Keep full-text OFF for speed\n"
-                "- Add/replace RSS feeds if some are dead"
+                "- Broader keywords (e.g., 'packaging waste')\n"
+                "- Increase RSS items per feed / Reddit max posts\n"
+                "- Replace dead RSS feeds\n"
+                "- Keep full-text OFF for speed"
             )
         else:
             st.success(f"Done — inserted {total_inserted} documents.")
 
-    st.info("Fast mode tip: keep full-text OFF. Titles/summaries are often enough for scanning dashboards.")
+    st.info("Note: sentiment is computed on (title + text snippet). It indicates tone/concerns, not objective policy outcomes.")
 
 with tab_explore:
     st.subheader("Explore data")
@@ -815,17 +953,21 @@ with tab_explore:
     else:
         sources = ["All"] + sorted(df["source"].dropna().unique().tolist())
         types = ["All"] + sorted(df["source_type"].dropna().unique().tolist())
+        sentiments = ["All", "Positive", "Neutral", "Negative"]
 
-        c1, c2, c3 = st.columns([1, 1, 2])
-        pick_source = c1.selectbox("Filter by source", sources, index=0)
-        pick_type = c2.selectbox("Filter by source type", types, index=0)
-        q = c3.text_input("Search in title/text", value="")
+        c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
+        pick_source = c1.selectbox("Source", sources, index=0)
+        pick_type = c2.selectbox("Source type", types, index=0)
+        pick_sent = c3.selectbox("Sentiment", sentiments, index=0)
+        q = c4.text_input("Search in title/text", value="")
 
         view = df.copy()
         if pick_source != "All":
             view = view[view["source"] == pick_source]
         if pick_type != "All":
             view = view[view["source_type"] == pick_type]
+        if pick_sent != "All":
+            view = view[view["sentiment_label"] == pick_sent]
         if q.strip():
             qq = q.strip().lower()
             view = view[
@@ -838,7 +980,7 @@ with tab_explore:
         show["collected_at"] = show["collected_at"].dt.strftime("%Y-%m-%d %H:%M").fillna("")
 
         st.dataframe(
-            show[["source_type", "source", "published_at", "domain", "title", "url"]],
+            show[["source_type", "source", "published_at", "domain", "sentiment_label", "sentiment_compound", "title", "url"]],
             use_container_width=True,
             hide_index=True,
         )
@@ -851,34 +993,59 @@ with tab_explore:
         )
 
 with tab_analyze:
-    st.subheader("Analyze (Dashboard)")
+    st.subheader("Analyze (Insights)")
     days_dash = st.slider("Analyze last N days", 7, 365, 180)
 
     df = load_docs(con, days=days_dash)
     if df.empty:
         st.info("No data yet. Collect first.")
     else:
-        m1, m2, m3, m4 = st.columns(4)
+        ts = df["published_at"].fillna(df["collected_at"])
+
+        # --- Top summary metrics
+        m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Documents", f"{len(df):,}")
         m2.metric("Sources", f"{df['source'].nunique()}")
-        m3.metric("Domains", f"{df['domain'].nunique()}")
-        m4.metric("With text", f"{int((df['text'].fillna('').str.len() > 0).sum())}")
+        m3.metric("Source types", f"{df['source_type'].nunique()}")
+        m4.metric("Domains", f"{df['domain'].nunique()}")
+        m5.metric("Avg sentiment", f"{df['sentiment_compound'].mean():.2f}")
 
-        st.write("### Documents over time")
+        # --- Key insights (the "reader-friendly" part)
+        st.write("## Key insights (auto-generated)")
+        insights = build_key_insights(df)
+        for b in insights:
+            st.markdown(f"- {b}")
+
+        st.write("---")
+
+        # --- Volume over time
+        st.write("### Attention over time (documents/day)")
         tmp = df.copy()
-        tmp["date"] = (tmp["published_at"].fillna(tmp["collected_at"])).dt.date
+        tmp["date"] = ts.dt.date
         daily = tmp.groupby("date").size().rename("count").to_frame()
         st.line_chart(daily)
 
-        st.write("### By source")
+        # --- Sentiment over time
+        st.write("### Sentiment over time (average/day)")
+        s_daily = tmp.groupby("date")["sentiment_compound"].mean().rename("avg_sentiment").to_frame()
+        st.line_chart(s_daily)
+
+        # --- Source mix
+        st.write("### Source mix")
         by_source = df["source"].value_counts().rename_axis("source").reset_index(name="count")
         st.bar_chart(by_source.set_index("source")["count"])
 
-        st.write("### By credibility category (source type)")
+        st.write("### Credibility / stakeholder sphere (source type)")
         by_type = df["source_type"].fillna("Other").value_counts().rename_axis("source_type").reset_index(name="count")
         st.bar_chart(by_type.set_index("source_type")["count"])
 
-        st.write("### Top terms (what people talk about most)")
+        # --- Sentiment by stakeholder sphere
+        st.write("### Sentiment by source type")
+        by_type_sent = df.groupby("source_type")["sentiment_compound"].mean().sort_values()
+        st.bar_chart(by_type_sent)
+
+        # --- Themes
+        st.write("### Top terms (dominant themes)")
         terms = top_terms(df, n=25)
         st.dataframe(terms, use_container_width=True)
 
@@ -889,6 +1056,7 @@ with tab_analyze:
         else:
             st.dataframe(emerg, use_container_width=True)
 
+        # --- Signal buckets
         st.write("### Signals (concerns / expectations buckets)")
         sig = simple_signals(df)
         if sig.empty:
@@ -897,16 +1065,21 @@ with tab_analyze:
             st.dataframe(sig, use_container_width=True)
             st.bar_chart(sig.set_index("signal")["count"])
 
-        st.write("### Recent items")
-        recent = df.head(20).copy()
-        recent["published_at"] = recent["published_at"].dt.strftime("%Y-%m-%d %H:%M").fillna("")
-        st.dataframe(
-            recent[["source_type", "source", "published_at", "title", "url"]],
-            use_container_width=True,
-            hide_index=True
-        )
+        # --- Most negative / positive items (useful for interpretation)
+        st.write("### Most negative & most positive items (for qualitative interpretation)")
+        cols = ["source_type", "source", "published_at", "sentiment_compound", "title", "url"]
+
+        most_neg = df.sort_values("sentiment_compound").head(8).copy()
+        most_neg["published_at"] = most_neg["published_at"].dt.strftime("%Y-%m-%d %H:%M").fillna("")
+        st.write("**Most negative**")
+        st.dataframe(most_neg[cols], use_container_width=True, hide_index=True)
+
+        most_pos = df.sort_values("sentiment_compound", ascending=False).head(8).copy()
+        most_pos["published_at"] = most_pos["published_at"].dt.strftime("%Y-%m-%d %H:%M").fillna("")
+        st.write("**Most positive**")
+        st.dataframe(most_pos[cols], use_container_width=True, hide_index=True)
 
         st.caption(
-            "Method note: This dashboard supports strategic scanning by combining (1) multi-source collection, "
-            "(2) credibility categories, (3) topic/term summaries, and (4) emerging-term detection as a weak-signal proxy."
+            "Method note: sentiment is computed with VADER on (title + snippet/body). It is used to detect stakeholder "
+            "concerns/expectations and shifts in discourse tone, not to predict legislative outcomes."
         )
