@@ -5,3 +5,4 @@ pandas
 beautifulsoup4
 python-dateutil
 gnews
+vaderSentiment
