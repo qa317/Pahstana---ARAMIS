@@ -830,7 +830,7 @@ with st.sidebar:
     st.subheader("GDELT settings")
     gdelt_days = st.slider("GDELT date window (auto-retries anyway)", 7, 90, 30)
     gdelt_max = st.slider("GDELT max records", 10, 300, 120, step=10)
-    gdelt_full_text = st.checkbox("GDELT: fetch full article text (slower)", value=False)
+    gdelt_full_text = False #st.checkbox("GDELT: fetch full article text (slower)", value=False)
     gdelt_full_text_n = st.slider("GDELT full-text limit", 0, 60, 15)
 
     st.subheader("RSS feeds (one per line)")
