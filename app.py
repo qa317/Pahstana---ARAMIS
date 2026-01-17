@@ -849,7 +849,7 @@ with st.sidebar:
     st.subheader("GNews (optional extra)")
     use_gnews = st.checkbox("Enable GNews source", value=True)
     lookback_days = st.slider("GNews lookback days", 7, 365, 180)
-    st.caption("Tip: 'EU' may not work everywhere; FR/DE/GB are safer.")
+    #st.caption("Tip: 'EU' may not work everywhere; FR/DE/GB are safer.")
     gnews_country = st.text_input("GNews country (2 letters)", "FR")
     gnews_language = st.text_input("GNews language (2 letters)", "en")
     gnews_max = st.slider("GNews max results per topic", 10, 100, 50, step=10)
