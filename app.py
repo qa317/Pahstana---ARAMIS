@@ -836,7 +836,7 @@ with st.sidebar:
     st.subheader("RSS feeds (one per line)")
     rss_text = st.text_area("RSS URLs", "\n".join(DEFAULT_RSS_FEEDS), height=180)
     rss_feeds = [u.strip() for u in rss_text.splitlines() if u.strip()]
-    rss_full_text = st.checkbox("RSS: fetch full article text (slower)", value=False)
+    rss_full_text = False#st.checkbox("RSS: fetch full article text (slower)", value=False)
     rss_max_per_feed = st.slider("RSS max items per feed", 5, 60, 25)
 
     st.subheader("Reddit (RSS search, no API keys)")
